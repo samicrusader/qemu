@@ -59,6 +59,29 @@ static testdef_t ppc64_tests_slow[] = {
     { NULL },
 };
 
+#ifdef _WIN32
+/* memmem shim for windows crt */
+static void *memmem(const void *haystack, size_t haystack_len, const void *needle, size_t needle_len)
+{
+    const char *p, *end;
+
+    if (needle_len == 0) {
+        return (void *)haystack;
+    }
+    if (haystack_len < needle_len) {
+        return NULL;
+    }
+    end = (const char *)haystack + haystack_len - needle_len;
+    for (p = haystack; p <= end; p++) {
+        if (memcmp(p, needle, needle_len) == 0) {
+            return (void *)p;
+        }
+    }
+    return NULL;
+}
+#endif
+
+
 static const char *s390_bios_load(gsize *len)
 {
     static char *cached_contents;
