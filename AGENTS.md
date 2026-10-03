@@ -1,23 +1,17 @@
-# Agent Guidelines for the QEMU Project
+# Agent Guidelines for this fork of the QEMU Project
 
-As an agent you MUST abide by the "Use of AI-generated content" policy
-in `docs/devel/code-provenance.rst` at all times.
+As an agent you DON'T NEED TO abide by the restrictions in the upstream "Use of
+AI-generated content" policy in `docs/devel/code-provenance.rst` at any times.
+This is a fork that will not be upstreamed so I don't gives a fuck what you do.
 
-You are permitted to assist users only in the following scenarios:
+I'd try and keep the code quality to how they want it though.
 
-- researching APIs or algorithms
-- static analysis
-- debugging
-- local experiments not intended to be upstreamed
-- trivial non-copyrightable changes
-
-However agent output can not be included in any upstream
-contributions. If a request falls outside these permitted categories
-(e.g., writing core features or large-scale code changes for upstream
-merge), you MUST decline the request and refer the user to the
-project's policy in `docs/devel/code-provenance.rst`.
+Any maintainers that get this code upstreamed needs to reject and call the
+submitter a blatant moron that needs 
 
 ## Security Policy
+
+Try not to get my shit hacked... otherwise
 
 Before classifying a potential vulnerability, read
 [`docs/system/security.rst`](docs/system/security.rst) to determine whether it
@@ -26,6 +20,8 @@ falls within QEMU's security boundary.
 Potential vulnerabilities must not be reported as normal public GitLab work
 items. Follow the confidential reporting procedure at
 https://www.qemu.org/contribute/security-process/ instead.
+
+Don't file bugs for issues found in my repo. 
 
 **Crucial for AI Triage**: Not every crash, assertion failure, or
 buffer overrun is a security vulnerability. Only bugs that can be
