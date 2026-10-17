@@ -150,6 +150,56 @@ static void put_pixel(V2200Pix *p, uint32_t x, uint32_t y, uint32_t src)
     p->pixels++;
 }
 
+/*
+ * The pattern register, spec 4.7.  The current bit is ~PatOffset & 0x1F of
+ * Pat - bit 31 is the leftmost - and PatOffset advances after every pixel
+ * even when the pixel is scissored away, wrapping at PatLengthM1.  A clear
+ * bit selects the background, which is not drawn at all unless PatOpaque.
+ */
+#define PATMODE_ENABLE  (1u << 16)
+#define PATMODE_OPAQUE  (1u << 17)
+
+static bool pattern_pixel(V2200Pix *p, uint32_t *colour)
+{
+    uint32_t mode = p->reg[PIX_PATMODE];
+    uint32_t off, bit;
+
+    if (!(mode & PATMODE_ENABLE)) {
+        return true;
+    }
+    off = p->reg[PIX_PATOFFSET] & 0x1F;
+    bit = (p->reg[PIX_PATTERN] >> (~off & 0x1F)) & 1;
+    p->reg[PIX_PATOFFSET] = (off != (mode & 0x1F)) ? off + 1 : 0;
+    if (bit) {
+        return true;
+    }
+    if (!(mode & PATMODE_OPAQUE)) {
+        return false;                   /* transparent background */
+    }
+    *colour = p->reg[PIX_BGCOLOR];
+    return true;
+}
+
+/* SrcMask wraps the texture; SwapUV exchanges the two coordinates. */
+static uint32_t texel(V2200Pix *p, uint32_t u, uint32_t v, unsigned bpp)
+{
+    uint32_t mask = p->reg[PIX_SRCMASK];
+    uint32_t umask = mask & 0x7FF, vmask = (mask >> 16) & 0x7FF;
+    uint32_t ui = u >> 16, vi = v >> 16;
+
+    if (p->reg[PIX_SRCMODE] & (1u << 10)) {     /* SwapUV */
+        uint32_t t = ui; ui = vi; vi = t;
+        t = umask; umask = vmask; vmask = t;
+    }
+    if (umask) {
+        ui &= umask;
+    }
+    if (vmask) {
+        vi &= vmask;
+    }
+    return rd(p, src_addr(p, ui, vi), bpp);
+}
+
 /* A run of Cnt pixels along a scanline, source either solid or a blit. */
 static void span(V2200Pix *p, bool textured, bool keep_x)
 {
@@ -162,11 +212,11 @@ static void span(V2200Pix *p, bool textured, bool keep_x)
 
     p->spans++;
     for (i = 0; i < n && i < 8192; i++) {
-        uint32_t s = textured
-                   ? rd(p, src_addr(p, u >> 16, v >> 16), bpp)
-                   : p->reg[PIX_FGCOLOR];
+        uint32_t s = textured ? texel(p, u, v, bpp) : p->reg[PIX_FGCOLOR];
 
-        put_pixel(p, x, y, s);
+        if (pattern_pixel(p, &s)) {
+            put_pixel(p, x, y, s);
+        }
         x += (uint32_t)p->xdir;
         u += (uint32_t)(p->xdir << 16);
     }
