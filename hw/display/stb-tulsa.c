@@ -1085,9 +1085,68 @@ static bool stb_v2200_is_blit_handler(uint32_t h)
  */
 static void stb_v2200_run_list(STBTulsaV2200 *s, uint32_t addr, bool replay);
 
+
+/* ---- host-time accounting (section 146) -------------------------- */
+
+static int64_t stb_prof_begin(void)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+static void stb_prof_end(STBTulsaV2200 *s, unsigned bucket, int64_t t0)
+{
+    uint64_t dt = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0);
+    STBTulsaProf *p = &s->prof[bucket];
+
+    p->ns += dt;
+    p->calls++;
+    p->ns_total += dt;
+    p->calls_total++;
+    if (dt > p->max_ns) {
+        p->max_ns = dt;
+    }
+}
+
+/*
+ * Report once a second from the field tick, which is the only thing here
+ * that runs on its own schedule.  The window is reported rather than the
+ * running total so a stall shows up as a spike instead of being averaged
+ * away over an hour of uptime.
+ */
+static void stb_prof_report(STBTulsaV2200 *s)
+{
+    static const char *const names[STB_PROF_MAX] = {
+        "list", "field", "composite", "reg"
+    };
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint64_t window;
+    unsigned i;
+
+    if (!s->prof_window) {
+        s->prof_window = now;
+        return;
+    }
+    window = (uint64_t)(now - s->prof_window);
+    if (window < 1000000000ULL) {
+        return;
+    }
+    for (i = 0; i < STB_PROF_MAX; i++) {
+        STBTulsaProf *p = &s->prof[i];
+
+        if (p->calls) {
+            trace_stb_tulsa_prof(s->role ?: "?", names[i], p->calls,
+                                 p->ns / 1000, p->max_ns / 1000,
+                                 (unsigned)(p->ns * 100 / window));
+        }
+        p->ns = p->max_ns = p->calls = 0;
+    }
+    s->prof_window = now;
+}
+
 static void stb_v2200_scroll_tick(void *opaque)
 {
     STBTulsaV2200 *s = opaque;
+    int64_t _t0 = stb_prof_begin();
     int i;
 
     for (i = 0; i < s->n_scroll; i++) {
@@ -1275,6 +1334,8 @@ static void stb_v2200_scroll_tick(void *opaque)
     }
 
     timer_mod(s->field_timer, stb_field_next(&s->field_deadline));
+    stb_prof_end(s, STB_PROF_FIELD, _t0);
+    stb_prof_report(s);
 }
 
 /*
@@ -1968,16 +2029,26 @@ static void stb_v2200_lle_list(STBTulsaV2200 *s, uint32_t addr)
                       s->role ?: "?", s->core.halt_pc,
                       s->core.halt_reason ?: "?");
         s->lle_running = false;
+    memset(s->prof, 0, sizeof(s->prof));
+    s->prof_window = 0;
     }
 }
 
 static void stb_v2200_decode_list(STBTulsaV2200 *s, uint32_t addr)
 {
+    int64_t t0 = stb_prof_begin();
+
     if (s->lle) {
         stb_v2200_lle_list(s, addr);
-        return;
+    } else {
+        stb_v2200_run_list(s, addr, false);
     }
-    stb_v2200_run_list(s, addr, false);
+    /*
+     * This ran inside the vCPU thread, holding the BQL, with the guest
+     * stopped on the store to the cmdptr aperture that got us here.  So
+     * this bucket is not "work the card did" - it is guest stall.
+     */
+    stb_prof_end(s, STB_PROF_LIST, t0);
 }
 
 /*
@@ -2038,7 +2109,8 @@ static void stb_v2200_risc_exec(STBTulsaV2200 *s, uint32_t insn)
     trace_stb_v2200_risc_step(s->role ?: "?", insn, op);
 }
 
-static uint64_t stb_v2200_reg_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t stb_v2200_reg_read_inner(void *opaque, hwaddr addr,
+                                         unsigned size)
 {
     STBTulsaV2200 *s = opaque;
     uint32_t val;
@@ -2117,7 +2189,7 @@ static uint64_t stb_v2200_reg_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
-static void stb_v2200_reg_write(void *opaque, hwaddr addr, uint64_t val,
+static void stb_v2200_reg_write_inner(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
 {
     STBTulsaV2200 *s = opaque;
@@ -2139,6 +2211,26 @@ static void stb_v2200_reg_write(void *opaque, hwaddr addr, uint64_t val,
     }
 
     trace_stb_v2200_reg_write(s->role ?: "?", addr, val);
+}
+
+static uint64_t stb_v2200_reg_read(void *opaque, hwaddr addr, unsigned size)
+{
+    STBTulsaV2200 *s = opaque;
+    int64_t t0 = stb_prof_begin();
+    uint64_t r = stb_v2200_reg_read_inner(opaque, addr, size);
+
+    stb_prof_end(s, STB_PROF_REG, t0);
+    return r;
+}
+
+static void stb_v2200_reg_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    STBTulsaV2200 *s = opaque;
+    int64_t t0 = stb_prof_begin();
+
+    stb_v2200_reg_write_inner(opaque, addr, val, size);
+    stb_prof_end(s, STB_PROF_REG, t0);
 }
 
 static const MemoryRegionOps stb_v2200_reg_ops = {
@@ -2344,7 +2436,7 @@ static void stb_v2200_yuyv_pixel(const uint8_t *row, uint32_t x,
     *b = CLAMP(bb, 0, 255);
 }
 
-static bool stb_v2200_gfx_update(void *opaque)
+static bool stb_v2200_gfx_update_inner(void *opaque)
 {
     STBTulsaV2200 *s = opaque;
     STBTulsaV2200 *v = s->peer;
@@ -2534,6 +2626,20 @@ static bool stb_v2200_gfx_update(void *opaque)
     return true;
 }
 
+/*
+ * These three all have several returns, so they are wrapped rather than
+ * instrumented in place - one timing pair each, no missed exits.
+ */
+static bool stb_v2200_gfx_update(void *opaque)
+{
+    STBTulsaV2200 *s = opaque;
+    int64_t t0 = stb_prof_begin();
+    bool r = stb_v2200_gfx_update_inner(opaque);
+
+    stb_prof_end(s, STB_PROF_COMPOSITE, t0);
+    return r;
+}
+
 static const GraphicHwOps stb_v2200_gfx_ops = {
     .gfx_update = stb_v2200_gfx_update,
 };
@@ -2591,6 +2697,32 @@ static void stb_v2200_realize(PCIDevice *pdev, Error **errp)
     s->field_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stb_v2200_scroll_tick, s);
     s->field_deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod(s->field_timer, stb_field_next(&s->field_deadline));
+
+    /*
+     * The running totals, so a session can read them live over QMP
+     * without waiting for a report window:
+     *   qom-get path=/machine/peripheral/tulsa-rgb property=prof-list-ns
+     */
+    {
+        static const char *const pname[STB_PROF_MAX] = {
+            "prof-list-ns", "prof-field-ns", "prof-composite-ns",
+            "prof-reg-ns"
+        };
+        static const char *const cname[STB_PROF_MAX] = {
+            "prof-list-calls", "prof-field-calls", "prof-composite-calls",
+            "prof-reg-calls"
+        };
+        unsigned i;
+
+        for (i = 0; i < STB_PROF_MAX; i++) {
+            object_property_add_uint64_ptr(OBJECT(s), pname[i],
+                                           &s->prof[i].ns_total,
+                                           OBJ_PROP_FLAG_READ);
+            object_property_add_uint64_ptr(OBJECT(s), cname[i],
+                                           &s->prof[i].calls_total,
+                                           OBJ_PROP_FLAG_READ);
+        }
+    }
 
     memory_region_init_io(&s->cmdptr, OBJECT(s), &stb_v2200_cmdptr_ops, s,
                           ptrname, 8);

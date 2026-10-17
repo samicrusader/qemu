@@ -633,6 +633,28 @@ struct STBTulsaATU {
     bool     vertical_doorbell;   /* ring the per-field ODR bits (68.7)   */
 };
 
+/*
+ * Host wall-clock accounting, in buckets.  Measured on
+ * QEMU_CLOCK_REALTIME rather than VIRTUAL, because the question is how
+ * much host time was spent, not how much guest time passed - and under
+ * -icount those are deliberately unrelated.
+ */
+enum {
+    STB_PROF_LIST,      /* a display list, in the vCPU thread  */
+    STB_PROF_FIELD,     /* the field timer, in the main loop   */
+    STB_PROF_COMPOSITE, /* the mixer and console upload        */
+    STB_PROF_REG,       /* every other MMIO access             */
+    STB_PROF_MAX,
+};
+
+typedef struct STBTulsaProf {
+    uint64_t ns;        /* total host time in this window      */
+    uint64_t max_ns;    /* the worst single call in it         */
+    uint64_t calls;
+    uint64_t ns_total;  /* and the same since reset, unwindowed */
+    uint64_t calls_total;
+} STBTulsaProf;
+
 struct STBTulsaV2200 {
     PCIDevice parent_obj;
 
@@ -699,6 +721,17 @@ struct STBTulsaV2200 {
      */
     bool         lle;
     bool         lle_running;      /* the microcode has been entered      */
+
+    /*
+     * Where the host's time goes (section 146).  Nothing here runs in
+     * parallel: a display list executes inside the vCPU thread, with the
+     * guest stopped on the store that submitted it, while the field tick
+     * and the mixer composite run in the main loop - and all three hold
+     * the BQL, so each one blocks the other two.  These buckets are the
+     * only way to tell which of them is eating a field.
+     */
+    STBTulsaProf prof[STB_PROF_MAX];
+    int64_t      prof_window;      /* start of the current report window  */
     V2200Core    core;
     V2200Pix     pix;
 

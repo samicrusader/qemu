@@ -270,3 +270,4 @@ stb_tulsa_guest_code(uint64_t pc, const char *bytes) "guest code at 0x%08" PRIx6
 stb_tulsa_atu_access(const char *dir, uint64_t off, unsigned size, uint32_t val, uint32_t window, uint64_t pc) "ATU %s +0x%04" PRIx64 " (%u) = 0x%08x [window 0x%08x pc 0x%08" PRIx64 "]"
 stb_tulsa_window(uint32_t base) "window select -> i960 local 0x%08x (ack in OMR1)"
 stb_v2200_risc_step(const char *role, uint32_t insn, uint8_t op) "v2200(%s) risc exec 0x%08x (op 0x%02x)"
+stb_tulsa_prof(const char *role, const char *bucket, uint64_t calls, uint64_t total_us, uint64_t max_us, unsigned pct) "v2200(%s) %-9s calls %5" PRIu64 " total %7" PRIu64 "us max %6" PRIu64 "us %2u%% of wall"
