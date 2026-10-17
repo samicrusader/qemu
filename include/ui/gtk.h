@@ -109,6 +109,12 @@ struct GtkDisplayState {
     GtkWidget *powerdown_item;
     GtkWidget *quit_item;
 
+    GtkWidget *macros_menu_item;
+    GtkWidget *macros_menu;
+
+    GtkWidget *media_menu_item;
+    GtkWidget *media_menu;
+
     GtkWidget *view_menu_item;
     GtkWidget *view_menu;
     GtkWidget *full_screen_item;

@@ -35,6 +35,8 @@
 #include "qapi/qapi-commands-control.h"
 #include "qapi/qapi-commands-machine.h"
 #include "qapi/qapi-commands-misc.h"
+#include "qapi/qapi-commands-block.h"
+#include "qapi/qapi-commands-block-core.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
@@ -812,12 +814,21 @@ void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget)
     GdkWindow *win = gtk_widget_get_window(widget);
     int refresh_rate;
 
+    /*
+     * gdk_display_get_monitor_at_window() can return NULL - the win32
+     * backend does whenever its monitor list is empty, which happens on
+     * this host - and gdk_monitor_get_refresh_rate() then fails its
+     * GDK_IS_MONITOR assertion.  That is once per expose: 20 warnings a
+     * second, forever, into whatever stderr is pointed at.  The assertion
+     * already returns 0, so this only removes the noise.
+     */
+    refresh_rate = 0;
     if (win) {
         GdkDisplay *dpy = gtk_widget_get_display(widget);
         GdkMonitor *monitor = gdk_display_get_monitor_at_window(dpy, win);
-        refresh_rate = gdk_monitor_get_refresh_rate(monitor); /* [mHz] */
-    } else {
-        refresh_rate = 0;
+        if (monitor) {
+            refresh_rate = gdk_monitor_get_refresh_rate(monitor); /* [mHz] */
+        }
     }
 
     gd_set_ui_refresh_rate(vc, refresh_rate);
@@ -1064,6 +1075,11 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
         int xr = (int)motion->x_root;
         int yr = (int)motion->y_root;
 
+        /* Same NULL as above; without a monitor there are no edges to
+         * warp away from, so there is nothing to do here. */
+        if (!monitor) {
+            return TRUE;
+        }
         gdk_monitor_get_geometry(monitor, &geometry);
 
         /* In relative mode check to see if client pointer hit
@@ -2695,6 +2711,462 @@ static void gd_create_menu_view(GtkDisplayState *s, DisplayOptions *opts)
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), s->show_menubar_item);
 }
 
+/* ------------------------------------------------------------------ */
+/* Macros menu: canned key sequences, in the spirit of a KVM's macro   */
+/* list.  Driving a guest over QMP sendkey drops sustained shifted     */
+/* characters and cannot express a three-key chord at all, so the      */
+/* common combinations live here instead.                              */
+
+#define GD_MACRO_MAX_KEYS 4
+
+typedef struct GdKeySeq {
+    int n;
+    QKeyCode keys[GD_MACRO_MAX_KEYS];
+} GdKeySeq;
+
+typedef struct GdMacro {
+    const char *label;                  /* NULL means a separator */
+    QKeyCode keys[GD_MACRO_MAX_KEYS];   /* terminated by UNMAPPED  */
+} GdMacro;
+
+static const GdMacro gd_macros_common[] = {
+    { "Ctrl-Alt-Del",       { Q_KEY_CODE_CTRL, Q_KEY_CODE_ALT, Q_KEY_CODE_DELETE } },
+    { "Ctrl-Alt-Backspace", { Q_KEY_CODE_CTRL, Q_KEY_CODE_ALT, Q_KEY_CODE_BACKSPACE } },
+    { "Ctrl-Shift-Esc",     { Q_KEY_CODE_CTRL, Q_KEY_CODE_SHIFT, Q_KEY_CODE_ESC } },
+    { NULL },
+    { "Ctrl-Esc",           { Q_KEY_CODE_CTRL, Q_KEY_CODE_ESC } },
+    { "Alt-Tab",            { Q_KEY_CODE_ALT, Q_KEY_CODE_TAB } },
+    { "Alt-Shift-Tab",      { Q_KEY_CODE_ALT, Q_KEY_CODE_SHIFT, Q_KEY_CODE_TAB } },
+    { "Alt-Esc",            { Q_KEY_CODE_ALT, Q_KEY_CODE_ESC } },
+    { "Alt-Space",          { Q_KEY_CODE_ALT, Q_KEY_CODE_SPC } },
+    { "Alt-Enter",          { Q_KEY_CODE_ALT, Q_KEY_CODE_RET } },
+    { "Alt-Hyphen",         { Q_KEY_CODE_ALT, Q_KEY_CODE_MINUS } },
+    { "Alt-F4",             { Q_KEY_CODE_ALT, Q_KEY_CODE_F4 } },
+    { NULL },
+    { "Tab",                { Q_KEY_CODE_TAB } },
+    { "Enter",              { Q_KEY_CODE_RET } },
+    { "Ctrl-Enter",         { Q_KEY_CODE_CTRL, Q_KEY_CODE_RET } },
+    { "Esc",                { Q_KEY_CODE_ESC } },
+    { "Pause",              { Q_KEY_CODE_PAUSE } },
+    { NULL },
+    { "PrtScrn",            { Q_KEY_CODE_PRINT } },
+    { "Alt-PrtScrn",        { Q_KEY_CODE_ALT, Q_KEY_CODE_PRINT } },
+    { "SysRq",              { Q_KEY_CODE_SYSRQ } },
+    { "Alt-SysRq",          { Q_KEY_CODE_ALT, Q_KEY_CODE_SYSRQ } },
+};
+
+static const QKeyCode gd_fkeys[] = {
+    Q_KEY_CODE_F1,  Q_KEY_CODE_F2,  Q_KEY_CODE_F3,  Q_KEY_CODE_F4,
+    Q_KEY_CODE_F5,  Q_KEY_CODE_F6,  Q_KEY_CODE_F7,  Q_KEY_CODE_F8,
+    Q_KEY_CODE_F9,  Q_KEY_CODE_F10, Q_KEY_CODE_F11, Q_KEY_CODE_F12,
+};
+
+static const struct {
+    const char *label;
+    const char *prefix;
+    QKeyCode mods[2];
+    int nmods;
+} gd_fkey_groups[] = {
+    { "F1 - F12",           "",           { 0, 0 },                              0 },
+    { "Ctrl + F1 - F12",    "Ctrl-",      { Q_KEY_CODE_CTRL, 0 },                1 },
+    { "Alt + F1 - F12",     "Alt-",       { Q_KEY_CODE_ALT, 0 },                 1 },
+    { "Shift + F1 - F12",   "Shift-",     { Q_KEY_CODE_SHIFT, 0 },               1 },
+    { "Ctrl-Alt + F1 - F12", "Ctrl-Alt-", { Q_KEY_CODE_CTRL, Q_KEY_CODE_ALT },   2 },
+};
+
+static void gd_send_key_seq(GtkDisplayState *s, const GdKeySeq *seq)
+{
+    VirtualConsole *vc = gd_vc_find_current(s);
+    unsigned int lnx[GD_MACRO_MAX_KEYS];
+    int i;
+
+    if (!vc || vc->type != GD_VC_GFX ||
+        !qemu_console_is_graphic(vc->gfx.dcl.con)) {
+        return;
+    }
+
+    /* Resolve every key before sending any, so a bad table entry cannot
+     * leave a modifier stuck down in the guest. */
+    for (i = 0; i < seq->n; i++) {
+        if (seq->keys[i] >= qemu_input_map_qcode_to_linux_len) {
+            return;
+        }
+        lnx[i] = qemu_input_map_qcode_to_linux[seq->keys[i]];
+        if (!lnx[i]) {
+            return;
+        }
+    }
+
+    /* Same order and pacing as qmp_send_key(): press in order, release in
+     * reverse, with the default hold delay between each. */
+    for (i = 0; i < seq->n; i++) {
+        qemu_input_event_send_key_linux(NULL, lnx[i], true);
+        qemu_input_event_send_key_delay(0);
+    }
+    for (i = seq->n; i-- > 0; ) {
+        qemu_input_event_send_key_linux(NULL, lnx[i], false);
+        qemu_input_event_send_key_delay(0);
+    }
+}
+
+static void gd_menu_macro(GtkMenuItem *item, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    const GdKeySeq *seq = g_object_get_data(G_OBJECT(item), "gd-keyseq");
+
+    if (seq) {
+        gd_send_key_seq(s, seq);
+    }
+}
+
+static void gd_macro_append(GtkDisplayState *s, GtkWidget *menu,
+                            const char *label, const QKeyCode *keys, int n)
+{
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    GdKeySeq *seq = g_new0(GdKeySeq, 1);
+    int i;
+
+    seq->n = MIN(n, GD_MACRO_MAX_KEYS);
+    for (i = 0; i < seq->n; i++) {
+        seq->keys[i] = keys[i];
+    }
+    g_object_set_data_full(G_OBJECT(item), "gd-keyseq", seq, g_free);
+    g_signal_connect(item, "activate", G_CALLBACK(gd_menu_macro), s);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+static GtkWidget *gd_create_menu_macros(GtkDisplayState *s)
+{
+    GtkWidget *macros_menu;
+    GtkWidget *separator;
+    size_t g, i;
+
+    macros_menu = gtk_menu_new();
+    gtk_menu_set_accel_group(GTK_MENU(macros_menu), s->accel_group);
+
+    for (i = 0; i < ARRAY_SIZE(gd_macros_common); i++) {
+        const GdMacro *m = &gd_macros_common[i];
+        int n = 0;
+
+        if (!m->label) {
+            separator = gtk_separator_menu_item_new();
+            gtk_menu_shell_append(GTK_MENU_SHELL(macros_menu), separator);
+            continue;
+        }
+        while (n < GD_MACRO_MAX_KEYS && m->keys[n] != Q_KEY_CODE_UNMAPPED) {
+            n++;
+        }
+        gd_macro_append(s, macros_menu, m->label, m->keys, n);
+    }
+
+    separator = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(macros_menu), separator);
+
+    for (g = 0; g < ARRAY_SIZE(gd_fkey_groups); g++) {
+        GtkWidget *sub = gtk_menu_new();
+        GtkWidget *item = gtk_menu_item_new_with_label(gd_fkey_groups[g].label);
+
+        gtk_menu_set_accel_group(GTK_MENU(sub), s->accel_group);
+        for (i = 0; i < ARRAY_SIZE(gd_fkeys); i++) {
+            QKeyCode keys[GD_MACRO_MAX_KEYS];
+            g_autofree char *label = NULL;
+            int n = 0, k;
+
+            for (k = 0; k < gd_fkey_groups[g].nmods; k++) {
+                keys[n++] = gd_fkey_groups[g].mods[k];
+            }
+            keys[n++] = gd_fkeys[i];
+            label = g_strdup_printf("%sF%d", gd_fkey_groups[g].prefix,
+                                    (int)(i + 1));
+            gd_macro_append(s, sub, label, keys, n);
+        }
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), sub);
+        gtk_menu_shell_append(GTK_MENU_SHELL(macros_menu), item);
+    }
+
+    return macros_menu;
+}
+
+/* ------------------------------------------------------------------ */
+/* Media menu: change and eject removable media without dropping to    */
+/* the monitor.  One submenu per removable block device, rebuilt every  */
+/* time the menu is opened so the labels show what is actually loaded.  */
+/*                                                                     */
+/* This calls qmp_blockdev_change_medium() directly rather than going   */
+/* through HMP `change`, which cannot take a path containing a space -  */
+/* so the file chooser may point anywhere, not only at the launch dir.  */
+
+typedef struct GdMedia {
+    char *device;                   /* BlockInfo::device, may be NULL  */
+    char *id;                       /* qdev id, may be NULL            */
+    char *dir;                      /* folder to open the chooser in   */
+} GdMedia;
+
+static void gd_media_free(void *p)
+{
+    GdMedia *m = p;
+
+    g_free(m->device);
+    g_free(m->id);
+    g_free(m->dir);
+    g_free(m);
+}
+
+/* Every dialog here is shown non-modally and answered from a "response"
+ * handler.  gtk_dialog_run() must not be used: it nests a GMainLoop, which
+ * re-enters QEMU's main loop while the BQL is held, and the process dies. */
+static void gd_dialog_dismiss(GtkDialog *dialog, int response, void *opaque)
+{
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+static void gd_media_complain(GtkDisplayState *s, const char *what, Error *err)
+{
+    GtkWidget *dialog;
+
+    dialog = gtk_message_dialog_new(GTK_WINDOW(s->window),
+                                    GTK_DIALOG_DESTROY_WITH_PARENT,
+                                    GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+                                    "%s: %s", what,
+                                    err ? error_get_pretty(err)
+                                        : "unknown error");
+    g_signal_connect(dialog, "response", G_CALLBACK(gd_dialog_dismiss), NULL);
+    gtk_widget_show_all(dialog);
+    error_free(err);
+}
+
+/* qmp_get_blk() insists on exactly one of 'device' and 'id', so pick the  */
+/* BlockBackend name when there is one and fall back to the qdev id only   */
+/* for a -blockdev-style device that has no name.  (BlockInfo::qdev is a   */
+/* QOM path for devices created without an explicit id, which blk_by_qdev_*/
+/* _id() will not resolve - nothing can be done about that from here.)     */
+static void gd_media_set_target(GdMedia *m, BlockInfo *info)
+{
+    if (info->device && info->device[0]) {
+        m->device = g_strdup(info->device);
+        m->id = NULL;
+    } else {
+        m->device = NULL;
+        m->id = info->qdev ? g_strdup(info->qdev) : NULL;
+    }
+}
+
+static void gd_menu_media_eject(GtkMenuItem *item, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    GdMedia *m = g_object_get_data(G_OBJECT(item), "gd-media");
+    Error *err = NULL;
+
+    if (!m) {
+        return;
+    }
+    qmp_eject(m->device, m->id, true, true, &err);
+    if (err) {
+        gd_media_complain(s, "Eject failed", err);
+    }
+}
+
+static void gd_media_chooser_response(GtkNativeDialog *native, int response,
+                                      void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    GdMedia *m = g_object_get_data(G_OBJECT(native), "gd-media");
+    Error *err = NULL;
+    char *filename;
+
+    if (response != GTK_RESPONSE_ACCEPT || !m) {
+        g_object_unref(native);
+        return;
+    }
+
+    filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(native));
+    if (filename) {
+        /* format NULL lets the block layer probe; force the tray so a guest
+         * that has locked it (NT does while a CD is mounted) still obeys.
+         * Calling the QMP function directly means the path may contain
+         * spaces, which HMP `change` cannot express. */
+        qmp_blockdev_change_medium(m->device, m->id, filename, NULL,
+                                   true, true, false, 0, &err);
+        g_free(filename);
+    }
+    g_object_unref(native);
+    if (err) {
+        gd_media_complain(s, "Change failed", err);
+    }
+}
+
+static void gd_menu_media_change(GtkMenuItem *item, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    GdMedia *m = g_object_get_data(G_OBJECT(item), "gd-media");
+    GtkFileChooserNative *native;
+    GtkFileFilter *filter;
+    GdMedia *copy;
+
+    if (!m) {
+        return;
+    }
+
+    /* GtkFileChooserNative, not GtkFileChooserDialog: the GTK-drawn chooser
+     * takes QEMU down on this host, and the native one is the right look on
+     * Windows anyway.  It is shown asynchronously and answered in the
+     * "response" handler - see the note on gd_dialog_dismiss(). */
+    native = gtk_file_chooser_native_new(_("Select disc or disk image"),
+                                         GTK_WINDOW(s->window),
+                                         GTK_FILE_CHOOSER_ACTION_OPEN,
+                                         _("_Open"), _("_Cancel"));
+    if (m->dir) {
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(native), m->dir);
+    }
+
+    filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, _("Disc and disk images"));
+    gtk_file_filter_add_pattern(filter, "*.iso");
+    gtk_file_filter_add_pattern(filter, "*.img");
+    gtk_file_filter_add_pattern(filter, "*.ima");
+    gtk_file_filter_add_pattern(filter, "*.vfd");
+    gtk_file_filter_add_pattern(filter, "*.bin");
+    gtk_file_filter_add_pattern(filter, "*.cue");
+    gtk_file_filter_add_pattern(filter, "*.qcow2");
+    gtk_file_filter_add_pattern(filter, "*.raw");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(native), filter);
+
+    filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, _("All files"));
+    gtk_file_filter_add_pattern(filter, "*");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(native), filter);
+
+    /* The menu is torn down and rebuilt every time it is opened, so the
+     * item's GdMedia cannot be relied on once the chooser is up.  Give the
+     * chooser its own copy. */
+    copy = g_new0(GdMedia, 1);
+    copy->device = g_strdup(m->device);
+    copy->id = g_strdup(m->id);
+    g_object_set_data_full(G_OBJECT(native), "gd-media", copy, gd_media_free);
+    g_signal_connect(native, "response",
+                     G_CALLBACK(gd_media_chooser_response), s);
+    gtk_native_dialog_show(GTK_NATIVE_DIALOG(native));
+}
+
+static void gd_media_append_device(GtkDisplayState *s, GtkWidget *menu,
+                                   BlockInfo *info, char *dir)
+{
+    GtkWidget *item, *sub, *entry, *separator;
+    const char *name;
+    char *label;
+    GdMedia *m;
+
+    name = (info->device && info->device[0]) ? info->device
+         : (info->qdev ? info->qdev : "(unnamed)");
+
+    if (info->inserted && info->inserted->file) {
+        const char *base = strrchr(info->inserted->file, '/');
+#ifdef _WIN32
+        const char *bs = strrchr(info->inserted->file, '\\');
+        if (bs && (!base || bs > base)) {
+            base = bs;
+        }
+#endif
+        label = g_strdup_printf("%s  [%s]", name,
+                                base ? base + 1 : info->inserted->file);
+    } else {
+        label = g_strdup_printf("%s  [empty]", name);
+    }
+
+    item = gtk_menu_item_new_with_label(label);
+    g_free(label);
+
+    sub = gtk_menu_new();
+    gtk_menu_set_accel_group(GTK_MENU(sub), s->accel_group);
+
+    entry = gtk_menu_item_new_with_mnemonic(_("_Image..."));
+    m = g_new0(GdMedia, 1);
+    gd_media_set_target(m, info);
+    m->dir = g_strdup(dir);
+    g_object_set_data_full(G_OBJECT(entry), "gd-media", m, gd_media_free);
+    g_signal_connect(entry, "activate", G_CALLBACK(gd_menu_media_change), s);
+    gtk_menu_shell_append(GTK_MENU_SHELL(sub), entry);
+
+    separator = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(sub), separator);
+
+    entry = gtk_menu_item_new_with_mnemonic(_("_Eject"));
+    m = g_new0(GdMedia, 1);
+    gd_media_set_target(m, info);
+    g_object_set_data_full(G_OBJECT(entry), "gd-media", m, gd_media_free);
+    g_signal_connect(entry, "activate", G_CALLBACK(gd_menu_media_eject), s);
+    gtk_widget_set_sensitive(entry, info->inserted != NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(sub), entry);
+
+    if (info->locked) {
+        entry = gtk_menu_item_new_with_label(_("tray locked by guest"));
+        gtk_widget_set_sensitive(entry, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(sub), entry);
+    }
+
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), sub);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+static void gd_media_rebuild(GtkWidget *unused, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    GList *children, *l;
+    BlockInfoList *head, *p;
+    Error *err = NULL;
+    bool any = false;
+    char *dir;
+
+    if (!s->media_menu) {
+        return;
+    }
+
+    children = gtk_container_get_children(GTK_CONTAINER(s->media_menu));
+    for (l = children; l; l = l->next) {
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    }
+    g_list_free(children);
+
+    /* The launcher starts QEMU in vm/, which is where the images live,  */
+    /* so that is the useful place for the chooser to open.              */
+    dir = g_get_current_dir();
+
+    head = qmp_query_block(false, false, &err);
+    if (err) {
+        error_free(err);
+        head = NULL;
+    }
+    for (p = head; p; p = p->next) {
+        if (!p->value->removable) {
+            continue;
+        }
+        gd_media_append_device(s, s->media_menu, p->value, dir);
+        any = true;
+    }
+    qapi_free_BlockInfoList(head);
+    g_free(dir);
+
+    if (!any) {
+        GtkWidget *item = gtk_menu_item_new_with_label(
+                _("no removable media devices"));
+        gtk_widget_set_sensitive(item, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(s->media_menu), item);
+    }
+
+    gtk_widget_show_all(s->media_menu);
+    if (gtk_widget_get_mapped(s->media_menu)) {
+        gtk_menu_reposition(GTK_MENU(s->media_menu));
+    }
+}
+
+static GtkWidget *gd_create_menu_media(GtkDisplayState *s)
+{
+    GtkWidget *media_menu = gtk_menu_new();
+
+    gtk_menu_set_accel_group(GTK_MENU(media_menu), s->accel_group);
+    return media_menu;
+}
+
 static void gd_create_menus(GtkDisplayState *s, DisplayOptions *opts)
 {
     GtkSettings *settings;
@@ -2702,6 +3174,8 @@ static void gd_create_menus(GtkDisplayState *s, DisplayOptions *opts)
     s->accel_group = gtk_accel_group_new();
     s->machine_menu = gd_create_menu_machine(s);
     gd_create_menu_view(s, opts);
+    s->macros_menu = gd_create_menu_macros(s);
+    s->media_menu = gd_create_menu_media(s);
 
     s->machine_menu_item = gtk_menu_item_new_with_mnemonic(_("_Machine"));
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(s->machine_menu_item),
@@ -2711,6 +3185,21 @@ static void gd_create_menus(GtkDisplayState *s, DisplayOptions *opts)
     s->view_menu_item = gtk_menu_item_new_with_mnemonic(_("_View"));
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(s->view_menu_item), s->view_menu);
     gtk_menu_shell_append(GTK_MENU_SHELL(s->menu_bar), s->view_menu_item);
+
+    s->macros_menu_item = gtk_menu_item_new_with_mnemonic(_("Ma_cros"));
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(s->macros_menu_item),
+                              s->macros_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(s->menu_bar), s->macros_menu_item);
+
+    s->media_menu_item = gtk_menu_item_new_with_mnemonic(_("Me_dia"));
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(s->media_menu_item),
+                              s->media_menu);
+    /* Repopulate on the menu's own "show": GtkMenuItem::activate is
+     * RUN_FIRST, so a handler there fires *after* GTK has already popped
+     * the submenu up and sized it, and the labels come out clipped. */
+    g_signal_connect(s->media_menu, "show",
+                     G_CALLBACK(gd_media_rebuild), s);
+    gtk_menu_shell_append(GTK_MENU_SHELL(s->menu_bar), s->media_menu_item);
 
     g_object_set_data(G_OBJECT(s->window), "accel_group", s->accel_group);
     gtk_window_add_accel_group(GTK_WINDOW(s->window), s->accel_group);
