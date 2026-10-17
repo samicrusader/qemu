@@ -339,21 +339,33 @@ static bool alu_x(V2200Core *c, unsigned op, unsigned d, unsigned s2i,
     switch (op & 0xF) {
     case 0x0: *out = s2 + (s1 << 16); return true;       /* addif  */
     case 0x1: *out = s2 - (s1 << 16); return true;       /* subif  */
-    case 0x2:                                            /* seedsr */
-        if (!imm && op == 0x53) {
-            /* scalar form, same operands */
+    /*
+     * Spec table 2.3b: 0x52 is abs and has no immediate form, while
+     * seedsr is 0x53 scalar and 0x42 immediate, and subfif is 0x43
+     * immediate only.  These two columns do not line up with the usual
+     * +0x10 pairing, and crossing them makes abs return the seed ROM's
+     * output - which silently disabled the scroll handlers' overshoot
+     * guard and deadlocked the beam test in the colour-key handlers.
+     */
+    case 0x2:
+        if (!imm) {                                      /* abs    */
+            *out = (uint32_t)(b < 0 ? -(int64_t)b : b);
+            return true;
         }
-        do_seed(c, s2);
+        do_seed(c, s2);                                  /* seedsr */
         *out = (c->reg[V2200_R_SCALE] >= s1)
              ? c->reg[V2200_R_SEED] >> (c->reg[V2200_R_SCALE] - s1)
              : c->reg[V2200_R_SEED];
         return true;
     case 0x3:
-        if (!imm) {                                      /* abs    */
-            *out = (uint32_t)(b < 0 ? -(int64_t)b : b);
+        if (imm) {                                       /* subfif */
+            *out = (s1 << 16) - s2;
             return true;
         }
-        *out = (s1 << 16) - s2;                          /* subfif */
+        do_seed(c, s2);                                  /* seedsr */
+        *out = (c->reg[V2200_R_SCALE] >= s1)
+             ? c->reg[V2200_R_SEED] >> (c->reg[V2200_R_SCALE] - s1)
+             : c->reg[V2200_R_SEED];
         return true;
     case 0x4: *out = s1 ? ((s2 >> (s1 & 31)) | (s2 << (32 - (s1 & 31))))
                         : s2; return true;               /* rotr   */
