@@ -596,6 +596,8 @@ static bool spill_oldest(I960Core *c)
     I960RegSet *s = &c->cache[0];
     int i;
 
+    c->spills++;
+
     if (s->fp < I960_MIN_FRAME) {
         c->halt_reason = "register spill to an implausible frame pointer";
         c->halt_ip = c->ip;

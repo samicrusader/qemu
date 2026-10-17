@@ -257,6 +257,7 @@ typedef struct I960Core {
      */
     uint64_t    mem_restores;
     uint64_t    tag_mismatches;
+    uint64_t    spills;       /* register sets written out to make room */
     uint32_t    last_mem_restore_ip, last_mem_restore_fp;
     uint32_t    last_mem_restore_tag;
     unsigned    last_mem_restore_depth;
