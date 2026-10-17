@@ -209,6 +209,21 @@ typedef struct I960Core {
     uint32_t    last_mem_restore_tag;
     unsigned    last_mem_restore_depth;
 
+    /*
+     * A ring of recent frame transitions.  Frame bugs are only ever
+     * diagnosed backwards - the ret that fails is rarely the one that
+     * did the damage - so each call, ret and interrupt records what it
+     * did to the chain.
+     */
+#define I960_FRAMELOG 24
+    struct {
+        uint32_t ip, pfp, rip, newfp;
+        unsigned depth;
+        char     kind;          /* 'c' call, 'r' ret, 'i' irq, 'R' irq-ret */
+        bool     from_cache;
+    } flog[I960_FRAMELOG];
+    unsigned    flog_n;
+
     uint64_t    icount;
 } I960Core;
 

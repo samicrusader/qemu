@@ -612,6 +612,16 @@ static bool spill_oldest(I960Core *c)
     return true;
 }
 
+static void flog(I960Core *c, char kind, uint32_t ip, uint32_t pfp,
+                 uint32_t rip, uint32_t newfp, bool from_cache)
+{
+    unsigned i = c->flog_n++ % I960_FRAMELOG;
+    c->flog[i].ip = ip;      c->flog[i].pfp = pfp;
+    c->flog[i].rip = rip;    c->flog[i].newfp = newfp;
+    c->flog[i].depth = c->depth;
+    c->flog[i].kind = kind;  c->flog[i].from_cache = from_cache;
+}
+
 static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
 {
     uint32_t oldfp = c->reg[I960_FP];
@@ -661,6 +671,7 @@ static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
     c->reg[I960_FP] = newfp;
     c->reg[I960_SP] = newfp + 64;      /* past the register save area */
     c->ip = target;
+    flog(c, 'c', retaddr - 4, oldfp, retaddr, newfp, false);
     return true;
 }
 
@@ -670,6 +681,7 @@ static bool do_ret(I960Core *c)
     uint32_t rip = c->reg[I960_RIP];
     uint32_t newfp = pfp & ~(uint32_t)(I960_FRAME_ALIGN - 1);
     unsigned type = pfp & 0x7;
+    bool used_cache = false;
     int i;
 
     if (pfp == 0) {
@@ -686,12 +698,11 @@ static bool do_ret(I960Core *c)
     }
 
     if (type == 7) {                                /* interrupt return */
-        uint32_t saved_pc, saved_ac, saved_ip;
+        uint32_t saved_pc, saved_ac;
         uint32_t fp = c->reg[I960_FP];
 
         if (!rd32m(c, fp - 16, &saved_pc) ||
-            !rd32m(c, fp - 12, &saved_ac) ||
-            !rd32m(c, fp - 8, &saved_ip)) {
+            !rd32m(c, fp - 12, &saved_ac)) {
             return false;
         }
         /*
@@ -711,7 +722,8 @@ static bool do_ret(I960Core *c)
         c->ac = saved_ac;
         c->pc = saved_pc;
         c->reg[I960_FP] = newfp;
-        c->ip = saved_ip;
+        c->ip = c->reg[I960_RIP];       /* from the restored set */
+        flog(c, 'R', fp, pfp, c->ip, newfp, false);
         return true;
     }
     if (type != 0) {
@@ -739,6 +751,7 @@ static bool do_ret(I960Core *c)
      * it is where a spill has to be written, and a mismatch is counted so
      * genuine drift is still visible.
      */
+    used_cache = c->depth != 0;
     if (c->depth) {
         I960RegSet *s = &c->cache[--c->depth];
         if (s->fp != newfp) {
@@ -761,6 +774,7 @@ static bool do_ret(I960Core *c)
     }
     c->reg[I960_FP] = newfp;
     c->ip = rip;
+    flog(c, 'r', c->halt_ip, pfp, rip, newfp, used_cache);
     return true;
 }
 
@@ -799,6 +813,15 @@ I960IrqResult i960_interrupt(I960Core *c, unsigned vector)
     s->fp = oldfp;
     memcpy(s->reg, c->reg, sizeof(s->reg));
 
+    /*
+     * The resume address goes into the SAVED set's RIP, not into the
+     * record.  Nucleus PLUS proves this is how the return works: to start
+     * a task it hand-builds two stacked save areas, puts the task entry
+     * in the inner one's RIP slot (st g4, 0x8(g1) with g4 = 0xa02ec308)
+     * and leaves the record's IP word zero.  A type-7 ret that read IP
+     * from the record would start every task at address 0.
+     */
+    s->reg[I960_RIP] = saved_ip;
     s->is_irq = true;
 
     /*
@@ -816,9 +839,14 @@ I960IrqResult i960_interrupt(I960Core *c, unsigned vector)
      * writes; the kernel writes its own and rets into it, so the record
      * has to be real memory in the layout the kernel uses.
      */
+    for (int k = 0; k < 16; k++) {          /* write-through, as for call */
+        if (!wr32m(c, oldfp + (uint32_t)k * 4, s->reg[k])) {
+            return I960_IRQ_FAULT;
+        }
+    }
+    /* PC and AC only; the IP word is not where the resume address lives. */
     if (!wr32m(c, newfp - 16, c->pc) ||
-        !wr32m(c, newfp - 12, c->ac) ||
-        !wr32m(c, newfp - 8, saved_ip)) {
+        !wr32m(c, newfp - 12, c->ac)) {
         return I960_IRQ_FAULT;
     }
 
@@ -830,6 +858,7 @@ I960IrqResult i960_interrupt(I960Core *c, unsigned vector)
     c->reg[I960_FP]  = newfp;
     c->reg[I960_SP]  = newfp + 64;     /* past the register save area */
     c->ip = handler;
+    flog(c, 'i', saved_ip, c->reg[I960_R0], saved_ip, newfp, false);
     return I960_IRQ_DELIVERED;
 }
 
