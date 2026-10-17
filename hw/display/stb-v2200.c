@@ -173,6 +173,11 @@ uint32_t v2200_reg_read(V2200Core *c, unsigned index)
     return c->reg[index & 0xFF];
 }
 
+uint32_t v2200_src(V2200Core *c, unsigned index)
+{
+    return c->reg[resolve(c, index)];
+}
+
 void v2200_reg_write(V2200Core *c, unsigned index, uint32_t v)
 {
     c->reg[index & 0xFF] = v;
@@ -383,7 +388,7 @@ static void engine_op(V2200Core *c, unsigned op, unsigned d, unsigned s2,
 {
     c->engine_ops++;
     if (c->engine) {
-        c->engine(c->opaque, op, d, s2, s1);
+        c->engine(c->opaque, c, op, d, s2, s1);
     }
 }
 
@@ -725,7 +730,26 @@ bool v2200_step(V2200Core *c)
             write_reg(c, D, read_reg(c, S2) + read_reg(c, S1));
         }
     } else if ((op >= 0xE0 && op <= 0xE5) || (op >= 0xF0 && op <= 0xFE)) {
-        engine_op(c, op, D, S2, S1);            /* draws */
+        /*
+         * Draw operands are register runs: "accessed as base + offset",
+         * with the S1 deltas at the same offsets as the S2 parameters, and
+         * the destination run getting S2 + S1 slot by slot (spec 2.7).
+         * FillRectSolid's entire body is one rdrawpxy in a branch delay
+         * slot, and it is this update - the row counter less one and the
+         * scanline plus 1.0, from the constant pair %allfs/%bit16 - that
+         * ends the loop.
+         */
+        static const uint8_t slots[16] = {
+            /* F0..FF */ 2, 2, 4, 4, 0, 0, 0, 0, 6, 6, 8, 8, 10, 10, 2, 0
+        };
+        unsigned n = (op >= 0xF0) ? slots[op & 0xF] : 2;
+        unsigned i;
+
+        engine_op(c, op, D, S2, S1);
+        for (i = 0; i < n; i++) {
+            write_reg(c, (D & ~1u) + i,
+                      read_reg(c, (S2 & ~1u) + i) + read_reg(c, (S1 & ~1u) + i));
+        }
     } else if (op >= 0xE7 && op <= 0xEF) {      /* the Fill Engine */
         uint32_t base = read_reg(c, S2 & ~1u);
         uint32_t delta = read_reg(c, S1);

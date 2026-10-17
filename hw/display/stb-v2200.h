@@ -95,8 +95,9 @@ typedef bool (*V2200FifoPeekFn)(void *opaque, uint32_t *out);
 /* A pixel-engine register write, handed out rather than acted on here. */
 typedef void (*V2200PixFn)(void *opaque, unsigned index, uint32_t value);
 /* A draw, step or fill instruction, likewise. */
-typedef void (*V2200EngineFn)(void *opaque, unsigned op, unsigned d,
-                              unsigned s2, unsigned s1);
+struct V2200Core;
+typedef void (*V2200EngineFn)(void *opaque, struct V2200Core *c, unsigned op,
+                              unsigned d, unsigned s2, unsigned s1);
 
 typedef struct V2200Core {
     uint32_t reg[V2200_NREG];
@@ -134,6 +135,8 @@ typedef struct V2200Core {
 void v2200_reset(V2200Core *c, uint32_t entry);
 bool v2200_step(V2200Core *c);
 uint32_t v2200_reg_read(V2200Core *c, unsigned index);
+/* Resolve an operand index (including the Seg windows) and read it. */
+uint32_t v2200_src(V2200Core *c, unsigned index);
 void v2200_reg_write(V2200Core *c, unsigned index, uint32_t v);
 const char *v2200_reg_name(unsigned index);
 
