@@ -200,6 +200,18 @@ static uint32_t texel(V2200Pix *p, uint32_t u, uint32_t v, unsigned bpp)
     return rd(p, src_addr(p, ui, vi), bpp);
 }
 
+/*
+ * Whether a draw takes its colour from a source surface is SrcFunc, bits
+ * 7:4 of SrcMode (spr 49) - 1 is Replace, the BitBlt case - and not
+ * SrcFmt in bits 3:0.  Setup leaves SrcMode at 0x0010, so testing the low
+ * nibble makes every blit draw FGColor instead of copying, which looks
+ * exactly like a correct blit of the wrong data.
+ */
+static bool src_in_use(const V2200Pix *p)
+{
+    return ((p->reg[PIX_SRCMODE] >> 4) & 0xF) != 0;
+}
+
 /* A run of Cnt pixels along a scanline, source either solid or a blit. */
 static void span(V2200Pix *p, bool textured, bool keep_x)
 {
@@ -242,7 +254,7 @@ void v2200_pix_reset(V2200Pix *p)
     p->cnt = 0;
     p->xdir = 1;
     p->udir = p->vdir = 1;
-    p->pixels = p->spans = p->fills = 0;
+    p->pixels = p->spans = p->fills = p->tris = 0;
 }
 
 void v2200_pix_spr(V2200Pix *p, unsigned index, uint32_t value)
@@ -303,7 +315,15 @@ void v2200_pix_engine(V2200Pix *p, V2200Core *c, unsigned op, unsigned d,
     /* ---- parallel draws (spec 2.8) ------------------------------- */
     case 0xE0:                                  /* drawp               */
     case 0xE1:                                  /* rdrawp              */
-        span(p, (p->reg[PIX_SRCMODE] & 0xF) != 0, true);
+        /*
+         * "Explicit drawing parameters are written to the Pixel Engine as
+         * they are read into S2" - so a parallel draw carries U in the odd
+         * half of its S2 pair rather than needing a step u before it,
+         * which is why the microcode's blit loop issues step v and step x
+         * but never a step u.
+         */
+        p->u = s2b;
+        span(p, src_in_use(p), true);
         return;
     case 0xE4:                                  /* drawpxy             */
     case 0xE5: {                                /* rdrawpxy            */
@@ -315,7 +335,71 @@ void v2200_pix_engine(V2200Pix *p, V2200Core *c, unsigned op, unsigned d,
          * next scanline, straight out of the constant register file.
          */
         p->y = s2b;
-        span(p, (p->reg[PIX_SRCMODE] & 0xF) != 0, false);
+        span(p, src_in_use(p), false);
+        return;
+    }
+
+    /* ---- the Triangle Engine (spec 2.10) ------------------------- */
+    case 0xFE: {
+        /*
+         * tri takes no operands worth the name: the Triangle Engine reads
+         * a fixed block of the register file (spec table 2.10d), %128 for
+         * the start values and %144/%160 for the two gradient banks, which
+         * is why the microcode issues `tri a12, %zero, %zero`.  DrawCtl
+         * b3:0 = 0xB enables the shadowing that keeps those registers and
+         * the engine in step; b4 to b11 say which parameters iterate.
+         */
+        const uint32_t *r = c->reg;
+        int32_t xtop = (int32_t)r[128], ytop = (int32_t)r[129];
+        int32_t xmid = (int32_t)r[144], ymid = (int32_t)r[145];
+        int32_t ybot = (int32_t)r[161];
+        int32_t dxlong = (int32_t)r[142];       /* a14 dXLong/dy        */
+        int32_t dxtop  = (int32_t)r[158];       /* a30 dXTop/dy         */
+        int32_t dxbot  = (int32_t)r[174];       /* q14 dXBot/dy         */
+        uint32_t dx    = r[160];                /* q0, b31 = direction  */
+        bool long_right = (dx & 0x80000000u) != 0;
+        uint32_t ctl = c->reg[V2200_R_DRAWCTL];
+        bool do_uv = (ctl & ((1u << 6) | (1u << 7))) != 0;
+        int32_t u = (int32_t)r[140], v = (int32_t)r[141];
+        int32_t dudx = (int32_t)r[156], dvdx = (int32_t)r[157];
+        int32_t dudy = (int32_t)r[172], dvdy = (int32_t)r[173];
+        int32_t xa = xtop, xb = xtop;
+        int32_t y, ylast = ybot >> 16;
+        unsigned bpp = v2200_pix_bpp(p);
+        bool textured = src_in_use(p);
+
+        p->tris++;
+        for (y = ytop >> 16; y < ylast && y - (ytop >> 16) < 4096; y++) {
+            int32_t left = long_right ? xb : xa;
+            int32_t right = long_right ? xa : xb;
+            int32_t xi, x0 = left >> 16, x1 = right >> 16;
+            int32_t su = u, sv = v;
+
+            if (y == (ymid >> 16)) {
+                xb = xmid;
+                right = long_right ? xa : xb;
+                left = long_right ? xb : xa;
+                x0 = left >> 16;
+                x1 = right >> 16;
+            }
+            for (xi = x0; xi < x1 && xi - x0 < 8192; xi++) {
+                uint32_t col = textured
+                             ? texel(p, (uint32_t)su, (uint32_t)sv, bpp)
+                             : p->reg[PIX_FGCOLOR];
+
+                put_pixel(p, (uint32_t)xi, (uint32_t)y, col);
+                if (do_uv) {
+                    su += dudx;
+                    sv += dvdx;
+                }
+            }
+            xa += dxlong;
+            xb += (y < (ymid >> 16)) ? dxtop : dxbot;
+            if (do_uv) {
+                u += dudy;
+                v += dvdy;
+            }
+        }
         return;
     }
 

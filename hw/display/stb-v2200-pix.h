@@ -48,6 +48,7 @@ typedef struct V2200Pix {
     uint64_t pixels;            /* how many have been written */
     uint64_t spans;
     uint64_t fills;
+    uint64_t tris;
 } V2200Pix;
 
 void v2200_pix_reset(V2200Pix *p);

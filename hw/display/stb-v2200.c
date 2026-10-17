@@ -744,9 +744,19 @@ bool v2200_step(V2200Core *c)
         };
         unsigned n = (op >= 0xF0) ? slots[op & 0xF] : 2;
         unsigned i;
+        /*
+         * Spec 2.8 and 2.9: the single forms (drawp, drawpxy, draw1..5)
+         * update the destination run as an addv; the repeated forms
+         * (rdrawp, rdraw1..5) do not touch it at all.  rdrawpxy is the
+         * exception the spec calls out - a resetting parallel draw
+         * updates the pair "exactly once" - and it has to be, because
+         * FillRectSolid's loop counter rides on that update.
+         */
+        bool updates_d = (op == 0xE0) || (op == 0xE4) || (op == 0xE5) ||
+                         (op >= 0xF0 && !(op & 1));
 
         engine_op(c, op, D, S2, S1);
-        for (i = 0; i < n; i++) {
+        for (i = 0; updates_d && i < n; i++) {
             write_reg(c, (D & ~1u) + i,
                       read_reg(c, (S2 & ~1u) + i) + read_reg(c, (S1 & ~1u) + i));
         }
