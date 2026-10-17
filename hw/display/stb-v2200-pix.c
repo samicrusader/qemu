@@ -60,7 +60,8 @@ static uint32_t src_addr(const V2200Pix *p, uint32_t u, uint32_t v)
 
     return p->reg[PIX_SRCBASE] +
            stride_term(v, s & 7, (s >> 4) & 7) +
-           u * (sfmt ? fmt_bpp(sfmt) : v2200_pix_bpp(p));
+           u * (sfmt == 0xD ? 2 : sfmt ? fmt_bpp(sfmt)
+                                       : v2200_pix_bpp(p));
 }
 
 /* The sixteen raster ops of DstMode b3:b0 (spec 4.4). */
@@ -247,8 +248,9 @@ static uint32_t apply_fog(const V2200Pix *p, uint32_t argb)
     unsigned f = p->fog & 0xFF;
     unsigned i, out = argb & 0xFF000000u;
 
-    if (!(p->reg[PIX_DSTMODE] & DSTMODE_FOG)) {
-        return argb;
+    if (!(p->reg[PIX_DSTMODE] & DSTMODE_FOG) ||
+        (p->reg[PIX_DSTMODE] & DSTMODE_YUV2RGB)) {
+        return argb;                    /* spec 4.15 forbids both at once */
     }
     for (i = 0; i < 3; i++) {
         int sc = (int)((argb >> (i * 8)) & 0xFF);
@@ -387,6 +389,37 @@ static bool pattern_pixel(V2200Pix *p, uint32_t *colour)
 }
 
 /*
+ * Colour-space conversion, spec 4.15.  The source is 4:2:2 - two pixels
+ * per 32-bit word sharing one Cb/Cr pair - and the conversion runs in the
+ * blend hardware, which is why the spec forbids blending and fog while it
+ * is on and why FogColor is reused to carry YUVBlack in its green byte.
+ *
+ *   sY = (YUVContrast + 256) * (Y - YUVBlack) + 128
+ *   R  = (sY + 407*(Cr-128)) / 255
+ *   G  = (sY - 207*(Cr-128) - 100*(Cb-128)) / 255
+ *   B  = (sY + 515*(Cb-128)) / 255
+ *
+ * YUVBlack is nominally 16 and YUVContrast 41, which is MPEG's range.
+ */
+static uint32_t yuv_to_rgb(const V2200Pix *p, unsigned y, unsigned cb,
+                           unsigned cr)
+{
+    int black = (int)((p->reg[PIX_FOGCOLOR] >> 8) & 0xFF);
+    int contrast = (int)(p->reg[PIX_YUVCONTRAST] & 0xFF);
+    int sy = (contrast + 256) * ((int)y - black) + 128;
+    int dr = (int)cr - 128, db = (int)cb - 128;
+    int r = (sy + 407 * dr) / 255;
+    int g = (sy - 207 * dr - 100 * db) / 255;
+    int b = (sy + 515 * db) / 255;
+
+    if (r < 0) { r = 0; } else if (r > 255) { r = 255; }
+    if (g < 0) { g = 0; } else if (g > 255) { g = 255; }
+    if (b < 0) { b = 0; } else if (b > 255) { b = 255; }
+    return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) |
+           (uint32_t)b;
+}
+
+/*
  * SrcMask wraps the texture, SwapUV exchanges the two coordinates, and
  * SrcFmt - SrcMode b3:b0 - says how to unpack what comes back.  The
  * result is 8888 ARGB like everything else inside the engine.
@@ -401,16 +434,47 @@ static uint32_t texel(V2200Pix *p, uint32_t u, uint32_t v, unsigned bpp)
         uint32_t t = ui; ui = vi; vi = t;
         t = umask; umask = vmask; vmask = t;
     }
-    if (umask) {
+    /*
+     * SrcMode b15/b16 are UClamp and VClamp - "clamp the texture U value
+     * such that 0 <= U <= UMask" (spec 4.1) - and when they are set the
+     * mask is a bound rather than an AND mask.  DDScale's SrcMode b7
+     * path ORs both of them in and computes UMask/VMask as the source
+     * bounding box, which is not a power of two minus one, so reading
+     * SrcMask as an AND mask there tears the image apart.
+     */
+    if (p->reg[PIX_SRCMODE] & (1u << 15)) {
+        ui = (int32_t)ui < 0 ? 0 : (ui > umask ? umask : ui);
+    } else if (umask) {
         ui &= umask;
     }
-    if (vmask) {
+    if (p->reg[PIX_SRCMODE] & (1u << 16)) {
+        vi = (int32_t)vi < 0 ? 0 : (vi > vmask ? vmask : vi);
+    } else if (vmask) {
         vi &= vmask;
     }
     {
         unsigned sfmt = p->reg[PIX_SRCMODE] & 0xF;
         unsigned sbpp = sfmt ? fmt_bpp(sfmt) : bpp;
 
+        if (sfmt == 0xD) {
+            /* 4:2:2 - the word holds Y0, Cr, Y1, Cb for two pixels. */
+            uint32_t w = rd(p, src_addr(p, ui & ~1u, vi), 4);
+            unsigned y = (ui & 1) ? ((w >> 8) & 0xFF) : ((w >> 24) & 0xFF);
+            unsigned c1 = (w >> 16) & 0xFF, c0 = w & 0xFF;
+            unsigned cr, cb;
+
+            if (p->reg[PIX_SRCMODE] & (1u << 13)) {     /* SrcBGR: Y0CbY1Cr */
+                cb = c1;
+                cr = c0;
+            } else {                                     /* Y0CrY1Cb       */
+                cr = c1;
+                cb = c0;
+            }
+            if (p->reg[PIX_DSTMODE] & DSTMODE_YUV2RGB) {
+                return yuv_to_rgb(p, y, cb, cr);
+            }
+            return 0xFF000000u | (y << 16) | (y << 8) | y;
+        }
         return unpack(sfmt ? sfmt : (p->reg[PIX_DSTFMT] & 0xF),
                       rd(p, src_addr(p, ui, vi), sbpp));
     }
@@ -446,7 +510,7 @@ static void span(V2200Pix *p, bool textured, bool keep_x)
             put_pixel(p, x, y, s);
         }
         x += (uint32_t)p->xdir;
-        u += (uint32_t)(p->xdir << 16);
+        u += (uint32_t)(p->udir << 16);
     }
     /*
      * drawp and rdrawp advance XShadow and U; the resetting drawpxy and
@@ -472,6 +536,7 @@ void v2200_pix_reset(V2200Pix *p)
     p->udir = p->vdir = 1;
     p->pixels = p->spans = p->fills = p->tris = p->zrejects = 0;
     p->fog = 255;
+    p->reg[PIX_YUVCONTRAST] = 41;       /* MPEG range, spec 4.15 */
 }
 
 void v2200_pix_spr(V2200Pix *p, unsigned index, uint32_t value)
@@ -485,6 +550,49 @@ void v2200_pix_spr(V2200Pix *p, unsigned index, uint32_t value)
                                   ((value & 0xFF) << 8); break;
     case 64: p->reg[PIX_DSTMODE] = (p->reg[PIX_DSTMODE] & ~0xFu) |
                                    (value & 0xF); break;
+    default: break;
+    }
+}
+
+/*
+ * The twelve things a parameterized draw can carry.  P_STAR is the
+ * spec's asterisk - "the register file entry is modified, but the field
+ * is not used by the Pixel Engine" - and P_I is V1000 monochrome
+ * shading, which sets R, G and B together.
+ */
+enum { P_NONE = 0, P_STAR, P_X, P_Y, P_Z, P_U, P_V, P_Q,
+       P_R, P_G, P_B, P_A, P_I, P_F };
+
+static void fgchan(V2200Pix *p, unsigned shift, uint32_t v)
+{
+    int32_t t = (int32_t)v >> 16;               /* 16I.16F, saturated   */
+
+    if (t < 0) {
+        t = 0;
+    } else if (t > 255) {
+        t = 255;
+    }
+    p->reg[PIX_FGCOLOR] = (p->reg[PIX_FGCOLOR] & ~(0xFFu << shift)) |
+                          ((uint32_t)t << shift);
+}
+
+static void load_param(V2200Pix *p, unsigned which, uint32_t v)
+{
+    switch (which) {
+    case P_X: p->xshadow = v; break;
+    case P_Y: p->y = v; break;
+    case P_Z: p->z = v; break;                  /* 21I.11F              */
+    case P_U: p->u = v; break;
+    case P_V: p->v = v; break;
+    case P_R: fgchan(p, 16, v); break;
+    case P_G: fgchan(p, 8, v); break;
+    case P_B: fgchan(p, 0, v); break;
+    case P_A: fgchan(p, 24, v); break;
+    case P_I: fgchan(p, 16, v); fgchan(p, 8, v); fgchan(p, 0, v); break;
+    case P_F: p->fog = (v >> 16) & 0xFF; break;
+    case P_Q:                                   /* no perspective yet   */
+    case P_STAR:
+    case P_NONE:
     default: break;
     }
 }
@@ -563,6 +671,91 @@ void v2200_pix_engine(V2200Pix *p, V2200Core *c, unsigned op, unsigned d,
          * next scanline, straight out of the constant register file.
          */
         p->y = s2b;
+        span(p, src_in_use(p), false);
+        return;
+    }
+
+    /* ---- parameterized draws (spec 2.9) -------------------------- */
+    case 0xF0: case 0xF1:                       /* draw1  / rdraw1     */
+    case 0xF2: case 0xF3:                       /* draw2  / rdraw2     */
+    case 0xF8: case 0xF9:                       /* draw3  / rdraw3     */
+    case 0xFA: case 0xFB:                       /* draw4  / rdraw4     */
+    case 0xFC: case 0xFD: {                     /* draw5  / rdraw5     */
+        /*
+         * A parameterized draw names no parameters: DrawCtl's four
+         * pair fields (spec table 2.9b) say which of X, Y, Z, U, V, Q,
+         * R, G, B, A, I and F the register run at D carries, two per
+         * pair, at "parameter offset from base" (table 2.9a).  The
+         * caller is expected to have loaded everything else through the
+         * step instructions, which is why DDScale's inner loop is a
+         * step y, a step v and one rdraw1: X and U ride in the register
+         * pair, Y and V come from the interpolators, and Cnt comes from
+         * the stepv cnt that also counts the rows down.
+         */
+        static const uint8_t npairs[16] = {
+            /* F0..FF */ 1, 1, 2, 2, 0, 0, 0, 0, 3, 3, 4, 4, 5, 5, 0, 0
+        };
+        /* table 2.9c, pair1: XShadow source, E1, O1 */
+        static const uint8_t pair1[16][3] = {
+            { P_NONE, P_X,    P_STAR }, { P_X,    P_Q,    P_STAR },
+            { P_NONE, P_X,    P_Y    }, { P_X,    P_Q,    P_Y    },
+            { P_NONE, P_X,    P_U    }, { P_X,    P_Q,    P_U    },
+            { P_NONE, P_X,    P_R    }, { P_X,    P_Q,    P_R    },
+            { P_NONE, P_X,    P_A    }, { P_X,    P_Q,    P_A    },
+            { P_NONE, P_Z,    P_X    }, { P_NONE, P_NONE, P_NONE },
+            { P_NONE, P_X,    P_F    }, { P_X,    P_Q,    P_F    },
+            { P_NONE, P_Y,    P_U    }, { P_Y,    P_Q,    P_U    },
+        };
+        /* table 2.9c, pair2: E2, O2 - only 8..31 are defined */
+        static const uint8_t pair2[32][2] = {
+            { P_NONE, P_NONE }, { P_NONE, P_NONE }, { P_NONE, P_NONE },
+            { P_NONE, P_NONE }, { P_NONE, P_NONE }, { P_NONE, P_NONE },
+            { P_NONE, P_NONE }, { P_NONE, P_NONE },
+            { P_X, P_V }, { P_Y, P_V }, { P_R, P_V }, { P_STAR, P_V },
+            { P_I, P_V }, { P_Z, P_V }, { P_A, P_V }, { P_Z, P_U },
+            { P_G, P_B }, { P_Z, P_A }, { P_Z, P_STAR }, { P_STAR, P_F },
+            { P_Z, P_F }, { P_F, P_V }, { P_R, P_F }, { P_R, P_A },
+            { P_R, P_STAR }, { P_Z, P_R }, { P_STAR, P_A }, { P_F, P_A },
+            { P_I, P_STAR }, { P_Z, P_I }, { P_I, P_A }, { P_I, P_F },
+        };
+        /* table 2.9c, pair3 and pair4 share one column pair */
+        static const uint8_t pair34[16][2] = {
+            { P_G, P_B }, { P_Z, P_A }, { P_Z, P_STAR }, { P_STAR, P_F },
+            { P_Z, P_F }, { P_NONE, P_NONE }, { P_R, P_F }, { P_R, P_A },
+            { P_R, P_STAR }, { P_Z, P_R }, { P_STAR, P_A }, { P_F, P_A },
+            { P_I, P_STAR }, { P_Z, P_I }, { P_I, P_A }, { P_I, P_F },
+        };
+        uint32_t ctl = c->reg[V2200_R_DRAWCTL];
+        unsigned np = npairs[op & 0xF];
+        unsigned f1 = ctl & 0xF, f2 = (ctl >> 4) & 0x1F;
+        unsigned f3 = (ctl >> 9) & 0xF, f4 = (ctl >> 13) & 7;
+        unsigned base = d & ~1u;
+
+        /* "Cnt is treated as a signed 16-bit number.  If Cnt <= 0, no
+         * draw occurs and Cnt is unchanged." */
+        if ((int16_t)(uint16_t)p->cnt <= 0) {
+            return;
+        }
+        if (np >= 1) {
+            load_param(p, pair1[f1][1], v2200_src(c, base));
+            load_param(p, pair1[f1][2], v2200_src(c, base + 1));
+        }
+        if (np >= 2) {
+            load_param(p, pair2[f2][0], v2200_src(c, base + 2));
+            load_param(p, pair2[f2][1], v2200_src(c, base + 3));
+        }
+        if (np >= 3) {
+            load_param(p, pair34[f3][0], v2200_src(c, base + 4));
+            load_param(p, pair34[f3][1], v2200_src(c, base + 5));
+        }
+        if (np >= 4) {
+            load_param(p, pair34[f4][0], v2200_src(c, base + 6));
+            load_param(p, pair34[f4][1], v2200_src(c, base + 7));
+        }
+        if (np >= 5) {                          /* table 2.9a: G then B */
+            load_param(p, P_G, v2200_src(c, base + 8));
+            load_param(p, P_B, v2200_src(c, base + 9));
+        }
         span(p, src_in_use(p), false);
         return;
     }

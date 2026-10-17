@@ -33,6 +33,7 @@
 #define PIX_BGCOLOR  20
 #define PIX_FOGCOLOR 21
 #define PIX_DSTCOLOR 22
+#define PIX_YUVCONTRAST 24
 #define PIX_SYNC     31
 
 /* DstMode bits (spec table 4.4). */
