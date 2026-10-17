@@ -1340,6 +1340,114 @@ static bool exec_xadd(CPUX86State *env, struct x86_decode *decode)
     return 0;
 }
 
+/*
+ * Stack width for PUSH/POP: long mode always uses a 64-bit stack pointer,
+ * otherwise SS.B picks between ESP and SP.  This is deliberately taken from
+ * the stack segment rather than from decode->addressing_size: a 0x67 prefix
+ * on "push dword [mem]" changes how the *source* is addressed, not the
+ * stack.
+ */
+static int stack_addr_size(CPUX86State *env)
+{
+    if (x86_is_long_mode(env_cpu(env))) {
+        return 8;
+    }
+    return (env->segs[R_SS].flags & DESC_B_MASK) ? 4 : 2;
+}
+
+static int stack_operand_size(CPUX86State *env, struct x86_decode *decode)
+{
+    /*
+     * PUSH/POP default to the stack width; in long mode the default operand
+     * size is 64 bits and a 32-bit form does not exist, so only an explicit
+     * 0x66 prefix (operand_size 2) narrows it.
+     */
+    if (x86_is_long_mode(env_cpu(env))) {
+        return decode->operand_size == 2 ? 2 : 8;
+    }
+    return decode->operand_size;
+}
+
+static void set_stack_ptr(CPUX86State *env, target_ulong val)
+{
+    switch (stack_addr_size(env)) {
+    case 8:
+        RSP(env) = val;
+        break;
+    case 4:
+        RSP(env) = (uint32_t)val;
+        break;
+    default:
+        RSP(env) = (RSP(env) & ~0xffffULL) | (val & 0xffff);
+        break;
+    }
+}
+
+static target_ulong get_stack_ptr(CPUX86State *env)
+{
+    switch (stack_addr_size(env)) {
+    case 8:
+        return RSP(env);
+    case 4:
+        return (uint32_t)RSP(env);
+    default:
+        return (uint16_t)RSP(env);
+    }
+}
+
+static bool exec_push(CPUX86State *env, struct x86_decode *decode)
+{
+    int size = stack_operand_size(env, decode);
+    target_ulong val, sp;
+
+    /*
+     * "push esp" stores the value from before the decrement, so the operand
+     * has to be read first.
+     */
+    if (fetch_operands(env, decode, 1, true, false, false)) {
+        return 1;
+    }
+    val = decode->op[0].val;
+
+    sp = get_stack_ptr(env) - size;
+    if (x86_write_mem(env_cpu(env), &val,
+                      linear_addr(env_cpu(env), sp, R_SS), size)) {
+        return 1;
+    }
+    set_stack_ptr(env, sp);
+
+    env->eip += decode->len;
+    return 0;
+}
+
+static bool exec_pop(CPUX86State *env, struct x86_decode *decode)
+{
+    int size = stack_operand_size(env, decode);
+    target_ulong val = 0, sp;
+
+    if (fetch_operands(env, decode, 1, false, false, false)) {
+        return 1;
+    }
+
+    sp = get_stack_ptr(env);
+    if (read_val_from_mem(env, linear_addr(env_cpu(env), sp, R_SS),
+                          size, &val)) {
+        return 1;
+    }
+    /*
+     * The stack pointer moves before the destination is written, so
+     * "pop esp" and "pop [esp+n]" both see the popped stack.
+     */
+    set_stack_ptr(env, sp + size);
+
+    if (write_val_ext(env, &decode->op[0], val, size)) {
+        return 1;
+    }
+
+    env->eip += decode->len;
+    return 0;
+}
+
 static struct cmd_handler {
     enum x86_decode_cmd cmd;
     bool (*handler)(CPUX86State *env, struct x86_decode *ins);
@@ -1384,6 +1492,8 @@ static struct cmd_handler {
     {X86_DECODE_CMD_MOVSX, exec_movsx},
     {X86_DECODE_CMD_XCHG, exec_xchg},
     {X86_DECODE_CMD_XADD, exec_xadd},
+    {X86_DECODE_CMD_PUSH, exec_push},
+    {X86_DECODE_CMD_POP, exec_pop},
 };
 
 static struct cmd_handler _cmd_handler[X86_DECODE_CMD_LAST];
