@@ -33,7 +33,10 @@
 #define PIX_BGCOLOR  20
 #define PIX_FOGCOLOR 21
 #define PIX_DSTCOLOR 22
+#define PIX_CHROMACOLOR 23
 #define PIX_YUVCONTRAST 24
+#define PIX_CHROMAMASK 26
+#define PIX_ALPHATHRES 29
 #define PIX_SYNC     31
 
 /* DstMode bits (spec table 4.4). */
@@ -45,6 +48,19 @@
 #define DSTMODE_DITHER     0x00100000u
 #define DSTMODE_FOG        0x00200000u
 #define DSTMODE_DSTRDDIS   0x00800000u
+#define DSTMODE_DSTBGR     0x01000000u
+#define DSTMODE_TRANSPREJ  0x02000000u
+
+/* SrcMode bits (spec table 4.1). */
+#define SRCMODE_FMT        0x0000000Fu
+#define SRCMODE_FUNC       0x00000070u   /* b6:4, NOT b7:4 - b7 is filter */
+#define SRCMODE_FILTER     0x00000080u
+#define SRCMODE_SWAPUV     0x00000400u
+#define SRCMODE_CHROMAKEY  0x00000800u
+#define SRCMODE_BGR        0x00002000u
+#define SRCMODE_CHROMABLKY 0x00004000u
+#define SRCMODE_UCLAMP     0x00008000u
+#define SRCMODE_VCLAMP     0x00010000u
 
 typedef struct V2200Pix {
     uint32_t reg[256];          /* the raw spr values */

@@ -317,6 +317,70 @@ static bool z_test(V2200Pix *p, uint32_t x, uint32_t y)
  * DstMode; scissoring uses ScissorX/ScissorY, which the microcode
  * programs from CMD_SETCLIPPING.
  */
+/*
+ * The blend unit, spec table 4.4.  BlendSrcFunc is DstMode b7:4 and
+ * BlendDstFunc b11:8, and the two function tables are *not* the same:
+ * code 0 is BlendDstColor on the source side and BlendSrcColor on the
+ * destination side, 10 and 11 likewise swap.  The result is
+ * src * SrcFunc + dst * DstFunc per channel, saturated, and it feeds
+ * the ALU as the new source.  "Other blend functions are disabled when
+ * [YUV2RGB] is set", so the caller keeps the two apart.
+ */
+static unsigned blend_factor(unsigned code, bool for_dst, unsigned chan,
+                             uint32_t s, uint32_t d)
+{
+    unsigned sa = (s >> 24) & 0xFF, da = (d >> 24) & 0xFF;
+    unsigned sc = (s >> (chan * 8)) & 0xFF;
+    unsigned dc = (d >> (chan * 8)) & 0xFF;
+    unsigned sat = sa < 255 - da ? sa : 255 - da;
+
+    switch (code) {
+    case 0:  return for_dst ? sc : dc;
+    case 1:  return 255 - (for_dst ? sc : dc);
+    case 2:  return sa;
+    case 3:  return 255 - sa;
+    case 4:  return da;
+    case 5:  return 255 - da;
+    case 6:  return 0;
+    case 7:  return 255;
+    case 8:  return sat;
+    case 9:  return 255 - sat;
+    case 10: return for_dst ? dc : sc;
+    case 11: return 255 - (for_dst ? dc : sc);
+    default: return 255;                /* 15, AddSigned, handled above */
+    }
+}
+
+static uint32_t blend(const V2200Pix *p, uint32_t s, uint32_t d)
+{
+    unsigned sf = (p->reg[PIX_DSTMODE] >> 4) & 0xF;
+    unsigned df = (p->reg[PIX_DSTMODE] >> 8) & 0xF;
+    uint32_t out = 0;
+    unsigned k;
+
+    for (k = 0; k < 4; k++) {
+        int sc = (int)((s >> (k * 8)) & 0xFF);
+        int dc = (int)((d >> (k * 8)) & 0xFF);
+        int v;
+
+        if (sf == 0xF) {                        /* BlendAddSignedSrc   */
+            v = sc + dc - 128;
+        } else if (df == 0xF) {                 /* BlendAddSignedDst   */
+            v = dc + sc - 128;
+        } else {
+            v = (sc * (int)blend_factor(sf, false, k, s, d) +
+                 dc * (int)blend_factor(df, true, k, s, d) + 127) / 255;
+        }
+        if (v < 0) {
+            v = 0;
+        } else if (v > 255) {
+            v = 255;
+        }
+        out |= (uint32_t)v << (k * 8);
+    }
+    return out;
+}
+
 static void put_pixel(V2200Pix *p, uint32_t x, uint32_t y, uint32_t argb)
 {
     unsigned fmt = p->reg[PIX_DSTFMT] & 0xF;
@@ -324,6 +388,15 @@ static void put_pixel(V2200Pix *p, uint32_t x, uint32_t y, uint32_t argb)
     uint32_t sx = p->reg[PIX_SCISSORX], sy = p->reg[PIX_SCISSORY];
     uint32_t a, d, r, mask, src;
 
+    /*
+     * DstMode b25: "pixels with texture unit output of Alpha <=
+     * AlphaThres will not be written".  This is how the colour-key
+     * handlers drop the keyed texels that chroma_black() zeroed.
+     */
+    if ((p->reg[PIX_DSTMODE] & DSTMODE_TRANSPREJ) &&
+        ((argb >> 24) & 0xFF) <= (p->reg[PIX_ALPHATHRES] & 0xFF)) {
+        return;
+    }
     if (sx) {
         uint32_t l = (sx >> 16) & 0xFFF, rt = sx & 0xFFF;
 
@@ -346,6 +419,11 @@ static void put_pixel(V2200Pix *p, uint32_t x, uint32_t y, uint32_t argb)
     d = (p->reg[PIX_DSTMODE] & DSTMODE_DSTRDDIS)
       ? pack(p, fmt, p->reg[PIX_DSTCOLOR], x, y)
       : rd(p, a, bpp);
+    if ((p->reg[PIX_DSTMODE] & DSTMODE_BLEND) &&
+        !(p->reg[PIX_DSTMODE] & DSTMODE_YUV2RGB)) {
+        src = pack(p, fmt, blend(p, apply_fog(p, argb),
+                                 unpack(fmt, d)), x, y);
+    }
     r = alu_mode(p->reg[PIX_DSTMODE] & 0xF, src, d);
     mask = p->reg[PIX_PMASK];
     if (bpp < 4) {
@@ -424,7 +502,46 @@ static uint32_t yuv_to_rgb(const V2200Pix *p, unsigned y, unsigned cb,
  * SrcFmt - SrcMode b3:b0 - says how to unpack what comes back.  The
  * result is 8888 ARGB like everything else inside the engine.
  */
-static uint32_t texel(V2200Pix *p, uint32_t u, uint32_t v, unsigned bpp)
+/*
+ * "If set and chroma key matches, texture data (a, r, g, b) =
+ * (0, 128, 16, 128)" - the YUV black triple, which the conversion then
+ * turns into real black.  With the bit clear the texel is simply zero.
+ * Either way alpha is 0, so TranspReject drops it.
+ */
+static uint32_t chroma_black(const V2200Pix *p)
+{
+    if (!(p->reg[PIX_SRCMODE] & SRCMODE_CHROMABLKY)) {
+        return 0;
+    }
+    if (p->reg[PIX_DSTMODE] & DSTMODE_YUV2RGB) {
+        return yuv_to_rgb(p, 16, 128, 128) & 0x00FFFFFFu;
+    }
+    return 0x00801080u;
+}
+
+/*
+ * The chroma compare of spec 4.14 runs on "LeftJustifiedRawTexelData" -
+ * the texel as read, with 8- and 16-bit sources replicated up to 32
+ * bits so one mask covers every format.
+ */
+static uint32_t raw_left(unsigned sbpp, uint32_t w)
+{
+    switch (sbpp) {
+    case 1:  return (w & 0xFFu) * 0x01010101u;
+    case 2:  return ((w & 0xFFFFu) << 16) | (w & 0xFFFFu);
+    default: return w;
+    }
+}
+
+static bool chroma_hit(const V2200Pix *p, uint32_t left)
+{
+    uint32_t m = p->reg[PIX_CHROMAMASK];
+
+    return (left & m) == (p->reg[PIX_CHROMACOLOR] & m);
+}
+
+static uint32_t texel_point(V2200Pix *p, uint32_t u, uint32_t v,
+                            unsigned bpp)
 {
     uint32_t mask = p->reg[PIX_SRCMASK];
     uint32_t umask = mask & 0x7FF, vmask = (mask >> 16) & 0x7FF;
@@ -459,7 +576,13 @@ static uint32_t texel(V2200Pix *p, uint32_t u, uint32_t v, unsigned bpp)
         if (sfmt == 0xD) {
             /* 4:2:2 - the word holds Y0, Cr, Y1, Cb for two pixels. */
             uint32_t w = rd(p, src_addr(p, ui & ~1u, vi), 4);
-            unsigned y = (ui & 1) ? ((w >> 8) & 0xFF) : ((w >> 24) & 0xFF);
+            unsigned y;
+
+            if ((p->reg[PIX_SRCMODE] & SRCMODE_CHROMAKEY) &&
+                chroma_hit(p, w)) {
+                return chroma_black(p);
+            }
+            y = (ui & 1) ? ((w >> 8) & 0xFF) : ((w >> 24) & 0xFF);
             unsigned c1 = (w >> 16) & 0xFF, c0 = w & 0xFF;
             unsigned cr, cb;
 
@@ -475,21 +598,61 @@ static uint32_t texel(V2200Pix *p, uint32_t u, uint32_t v, unsigned bpp)
             }
             return 0xFF000000u | (y << 16) | (y << 8) | y;
         }
-        return unpack(sfmt ? sfmt : (p->reg[PIX_DSTFMT] & 0xF),
-                      rd(p, src_addr(p, ui, vi), sbpp));
+        {
+            uint32_t w = rd(p, src_addr(p, ui, vi), sbpp);
+
+            if ((p->reg[PIX_SRCMODE] & SRCMODE_CHROMAKEY) &&
+                chroma_hit(p, raw_left(sbpp, w))) {
+                return chroma_black(p);
+            }
+            return unpack(sfmt ? sfmt : (p->reg[PIX_DSTFMT] & 0xF), w);
+        }
     }
 }
 
 /*
  * Whether a draw takes its colour from a source surface is SrcFunc, bits
- * 7:4 of SrcMode (spr 49) - 1 is Replace, the BitBlt case - and not
+ * 6:4 of SrcMode (spr 49) - b7 is SrcFilter, not part of the field - 1 is Replace, the BitBlt case - and not
  * SrcFmt in bits 3:0.  Setup leaves SrcMode at 0x0010, so testing the low
  * nibble makes every blit draw FGColor instead of copying, which looks
  * exactly like a correct blit of the wrong data.
  */
+/*
+ * SrcMode b7 is SrcFilter: "=0: BitBlt and point sample; =1: bilinear
+ * filtering".  The four taps are point samples so they pick up the
+ * clamp, wrap and chroma-key handling for free.  A 4:2:2 source is
+ * filtered after conversion rather than in Y, Cb and Cr, which is an
+ * approximation - the part almost certainly filters chroma separately.
+ */
+static uint32_t texel(V2200Pix *p, uint32_t u, uint32_t v, unsigned bpp)
+{
+    uint32_t c00, c10, c01, c11, fu, fv, out = 0;
+    unsigned k;
+
+    if (!(p->reg[PIX_SRCMODE] & SRCMODE_FILTER)) {
+        return texel_point(p, u, v, bpp);
+    }
+    fu = (u >> 8) & 0xFF;
+    fv = (v >> 8) & 0xFF;
+    c00 = texel_point(p, u, v, bpp);
+    c10 = texel_point(p, u + 0x10000u, v, bpp);
+    c01 = texel_point(p, u, v + 0x10000u, bpp);
+    c11 = texel_point(p, u + 0x10000u, v + 0x10000u, bpp);
+    for (k = 0; k < 4; k++) {
+        unsigned sh = k * 8;
+        uint32_t a = (c00 >> sh) & 0xFF, b = (c10 >> sh) & 0xFF;
+        uint32_t c = (c01 >> sh) & 0xFF, d = (c11 >> sh) & 0xFF;
+        uint32_t top = a * (256 - fu) + b * fu;
+        uint32_t bot = c * (256 - fu) + d * fu;
+
+        out |= (((top * (256 - fv) + bot * fv) >> 16) & 0xFF) << sh;
+    }
+    return out;
+}
+
 static bool src_in_use(const V2200Pix *p)
 {
-    return ((p->reg[PIX_SRCMODE] >> 4) & 0xF) != 0;
+    return ((p->reg[PIX_SRCMODE] & SRCMODE_FUNC) >> 4) != 0;
 }
 
 /* A run of Cnt pixels along a scanline, source either solid or a blit. */
