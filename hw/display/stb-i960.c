@@ -893,8 +893,28 @@ I960IrqResult i960_interrupt(I960Core *c, unsigned vector)
         }
     }
     /* PC and AC only; the IP word is not where the resume address lives. */
+    /*
+     * The interrupt record, three words below the new frame:
+     *
+     *   newfp - 16   saved process controls
+     *   newfp - 12   saved arithmetic controls
+     *   newfp -  8   the VECTOR NUMBER
+     *
+     * The third word is not optional and it is not an IP.  The firmware's
+     * common interrupt entry loads all three with one `ldt` at
+     * 0xa02e9b10, passes the third to TCC_Dispatch_LISR, and that uses it
+     * to index the vector -> LISR-id table at 0xa033c210.  Leaving it zero
+     * makes every LISR-dispatched interrupt look like vector 0, which has
+     * no LISR, and Nucleus stops the system with error 4 - a `b .` at
+     * 0xa02eabb8 that spins forever.
+     *
+     * The timer does not go through that path (its handler is installed
+     * directly), which is why this was invisible until the Messaging
+     * Unit's doorbell was rung.
+     */
     if (!wr32m(c, newfp - 16, c->pc) ||
-        !wr32m(c, newfp - 12, c->ac)) {
+        !wr32m(c, newfp - 12, c->ac) ||
+        !wr32m(c, newfp -  8, vector)) {
         return I960_IRQ_FAULT;
     }
 
