@@ -1115,6 +1115,22 @@ bool i960_step(I960Core *c)
         case 0x598: r = (a > 31) ? 0 : (b >> a); break;             /* shro */
         case 0x59c: r = (a > 31) ? 0 : (b << a); break;             /* shlo */
         case 0x59e: r = (a > 31) ? 0 : (uint32_t)((int32_t)b << a); break;
+        /*
+         * shrdi: shift right DIVIDING integer - an arithmetic right shift
+         * that rounds toward zero, i.e. exactly b / 2^a in C's integer
+         * division, where shri (0x59b) rounds toward negative infinity.
+         * They differ only for negative b, and the firmware uses both, so
+         * folding them together would be wrong by one on half its inputs.
+         */
+        case 0x59a: {                                   /* shrdi    */
+            int32_t bv = (int32_t)b;
+            if (a > 31) {
+                r = (uint32_t)(bv < 0 ? 0 : 0);
+            } else {
+                r = (uint32_t)(bv / (int32_t)(1u << a));
+            }
+            break;
+        }
         case 0x59b: r = (a > 31) ? (uint32_t)((int32_t)b >> 31)
                                  : (uint32_t)((int32_t)b >> a); break;
         case 0x59d: {                                   /* rotate   */
