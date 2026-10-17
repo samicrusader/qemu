@@ -576,26 +576,6 @@ static void fgchan(V2200Pix *p, unsigned shift, uint32_t v)
                           ((uint32_t)t << shift);
 }
 
-static void load_param(V2200Pix *p, unsigned which, uint32_t v)
-{
-    switch (which) {
-    case P_X: p->xshadow = v; break;
-    case P_Y: p->y = v; break;
-    case P_Z: p->z = v; break;                  /* 21I.11F              */
-    case P_U: p->u = v; break;
-    case P_V: p->v = v; break;
-    case P_R: fgchan(p, 16, v); break;
-    case P_G: fgchan(p, 8, v); break;
-    case P_B: fgchan(p, 0, v); break;
-    case P_A: fgchan(p, 24, v); break;
-    case P_I: fgchan(p, 16, v); fgchan(p, 8, v); fgchan(p, 0, v); break;
-    case P_F: p->fog = (v >> 16) & 0xFF; break;
-    case P_Q:                                   /* no perspective yet   */
-    case P_STAR:
-    case P_NONE:
-    default: break;
-    }
-}
 
 void v2200_pix_engine(V2200Pix *p, V2200Core *c, unsigned op, unsigned d,
                       unsigned s2, unsigned s1)
@@ -729,34 +709,122 @@ void v2200_pix_engine(V2200Pix *p, V2200Core *c, unsigned op, unsigned d,
         unsigned np = npairs[op & 0xF];
         unsigned f1 = ctl & 0xF, f2 = (ctl >> 4) & 0x1F;
         unsigned f3 = (ctl >> 9) & 0xF, f4 = (ctl >> 13) & 7;
-        unsigned base = d & ~1u;
+        unsigned base = d & ~1u, dbase = s1 & ~1u;
+        uint8_t slot[10];
+        uint32_t val[14], del[14];
+        bool use[14];
+        unsigned k, i, n;
+        unsigned bpp = v2200_pix_bpp(p);
+        bool textured = src_in_use(p);
+        uint32_t y;
 
         /* "Cnt is treated as a signed 16-bit number.  If Cnt <= 0, no
          * draw occurs and Cnt is unchanged." */
         if ((int16_t)(uint16_t)p->cnt <= 0) {
             return;
         }
-        if (np >= 1) {
-            load_param(p, pair1[f1][1], v2200_src(c, base));
-            load_param(p, pair1[f1][2], v2200_src(c, base + 1));
-        }
+        memset(use, 0, sizeof(use));
+        memset(slot, P_NONE, sizeof(slot));
+        slot[0] = pair1[f1][1];
+        slot[1] = pair1[f1][2];
         if (np >= 2) {
-            load_param(p, pair2[f2][0], v2200_src(c, base + 2));
-            load_param(p, pair2[f2][1], v2200_src(c, base + 3));
+            slot[2] = pair2[f2][0];
+            slot[3] = pair2[f2][1];
         }
         if (np >= 3) {
-            load_param(p, pair34[f3][0], v2200_src(c, base + 4));
-            load_param(p, pair34[f3][1], v2200_src(c, base + 5));
+            slot[4] = pair34[f3][0];
+            slot[5] = pair34[f3][1];
         }
         if (np >= 4) {
-            load_param(p, pair34[f4][0], v2200_src(c, base + 6));
-            load_param(p, pair34[f4][1], v2200_src(c, base + 7));
+            slot[6] = pair34[f4][0];
+            slot[7] = pair34[f4][1];
         }
         if (np >= 5) {                          /* table 2.9a: G then B */
-            load_param(p, P_G, v2200_src(c, base + 8));
-            load_param(p, P_B, v2200_src(c, base + 9));
+            slot[8] = P_G;
+            slot[9] = P_B;
         }
-        span(p, src_in_use(p), false);
+        /*
+         * S2 is the run of starting values and S1 the run of per-pixel
+         * deltas at the same offsets (spec 2.7), so a parameterized draw
+         * iterates its own parameters along the span.  That is where a
+         * scaling blit's dU/dx lives: DDScale's `rdraw1 r64,r64,r74`
+         * pairs 1.0 with word 5, and OverlayScaleHandler's
+         * `rdraw1 r80,r80,r72` pairs it with the dU/dx that
+         * ScaleVideoPRead computed from the source and destination
+         * widths.
+         */
+        for (k = 0; k < 2 * np && k < 10; k++) {
+            unsigned which = slot[k];
+
+            if (which == P_NONE || which == P_STAR || which == P_Q) {
+                continue;
+            }
+            val[which] = v2200_src(c, base + k);
+            del[which] = v2200_src(c, dbase + k);
+            use[which] = true;
+        }
+        /* Anything not named by DrawCtl keeps the interpolator's value. */
+        if (!use[P_X]) {
+            val[P_X] = p->xshadow;
+            del[P_X] = (uint32_t)(p->xdir << 16);
+        }
+        if (!use[P_U]) {
+            val[P_U] = p->u;
+            del[P_U] = (uint32_t)(p->udir << 16);
+        }
+        if (!use[P_V]) {
+            val[P_V] = p->v;
+            del[P_V] = 0;
+        }
+        if (!use[P_Z]) {
+            val[P_Z] = p->z;
+            del[P_Z] = 0;
+        }
+        if (use[P_Y]) {
+            p->y = val[P_Y];
+        }
+        y = p->y >> 16;
+
+        /*
+         * "A draw instruction takes 3 cycles and an rdraw takes
+         * (2 + 2 * ParamPairs + 1 * pixels) cycles" - the single forms
+         * draw one pixel, the repeated forms draw Cnt of them.
+         */
+        n = (op & 1) ? p->cnt : 1;
+        p->spans++;
+        for (i = 0; i < n && i < 8192; i++) {
+            uint32_t col;
+
+            p->u = val[P_U];
+            p->v = val[P_V];
+            p->z = val[P_Z];
+            if (use[P_F]) {
+                p->fog = (val[P_F] >> 16) & 0xFF;
+            }
+            if (use[P_R]) { fgchan(p, 16, val[P_R]); }
+            if (use[P_G]) { fgchan(p, 8, val[P_G]); }
+            if (use[P_B]) { fgchan(p, 0, val[P_B]); }
+            if (use[P_A]) { fgchan(p, 24, val[P_A]); }
+            if (use[P_I]) {
+                fgchan(p, 16, val[P_I]);
+                fgchan(p, 8, val[P_I]);
+                fgchan(p, 0, val[P_I]);
+            }
+            col = textured ? texel(p, val[P_U], val[P_V], bpp)
+                           : p->reg[PIX_FGCOLOR];
+            if (pattern_pixel(p, &col)) {
+                put_pixel(p, val[P_X] >> 16, y, col);
+            }
+            for (k = 0; k < 14; k++) {
+                if (use[k]) {
+                    val[k] += del[k];
+                }
+            }
+            val[P_X] += use[P_X] ? 0 : del[P_X];
+            val[P_U] += use[P_U] ? 0 : del[P_U];
+            val[P_V] += use[P_V] ? 0 : del[P_V];
+            val[P_Z] += use[P_Z] ? 0 : del[P_Z];
+        }
         return;
     }
 
