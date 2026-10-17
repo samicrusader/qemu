@@ -1838,8 +1838,145 @@ static void stb_v2200_run_list(STBTulsaV2200 *s, uint32_t addr, bool replay)
     s->cmd_active = addr;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* The low-level cores                                                 */
+/*                                                                     */
+/* The V2200 interpreter and Pixel Engine reach Verite memory through   */
+/* these callbacks, so they see exactly the same 16 MiB the HLE path    */
+/* and the host's PCI window do.  The core does its own big-endian      */
+/* assembly on top of these, because the RISC is big-endian (spec 2.4)  */
+/* and the microcode image is a big-endian ELF uploaded byte for byte.  */
+/*                                                                      */
+/* The HLE path above reads the same words with ldl_le_p and agrees     */
+/* with what the driver writes, which is not a contradiction: section   */
+/* 20 found that CTulsaDirectDraw's ReadVeriteMemory/WriteVeriteMemory  */
+/* are endian-aware, taking LockEndianControlAccess and consulting      */
+/* GetCurrentEndianness(), and that in mode 3 each dword is 16-bit      */
+/* word-swapped on the way through.  The swap is the aperture's, under  */
+/* driver control, not the core's.  Which means these callbacks are     */
+/* right only while the board sits in whatever mode makes host dwords   */
+/* land in RISC order - and the endian control register's location is   */
+/* still section 20's open item 4.  Everything funnels through this one */
+/* pair so that when the register turns up there is a single place to   */
+/* honour it.                                                           */
+/* ------------------------------------------------------------------ */
+
+static bool stb_v2200_core_read(void *opaque, uint32_t addr, void *buf,
+                                unsigned len)
+{
+    STBTulsaV2200 *s = opaque;
+
+    if ((uint64_t)addr + len > STB_V2200_MEM_SIZE) {
+        return false;
+    }
+    memcpy(buf, s->vram + addr, len);
+    return true;
+}
+
+static bool stb_v2200_core_write(void *opaque, uint32_t addr, const void *buf,
+                                 unsigned len)
+{
+    STBTulsaV2200 *s = opaque;
+
+    if ((uint64_t)addr + len > STB_V2200_MEM_SIZE) {
+        return false;
+    }
+    memcpy(s->vram + addr, buf, len);
+    return true;
+}
+
+static void stb_v2200_pix_spr_cb(void *opaque, unsigned index, uint32_t val)
+{
+    STBTulsaV2200 *s = opaque;
+
+    v2200_pix_spr(&s->pix, index, val);
+}
+
+static void stb_v2200_engine_cb(void *opaque, struct V2200Core *c,
+                                unsigned op, unsigned d, unsigned s2,
+                                unsigned s1)
+{
+    STBTulsaV2200 *s = opaque;
+
+    v2200_pix_engine(&s->pix, c, op, d, s2, s1);
+}
+
+/*
+ * Bring the interpreter up on the microcode the driver has already
+ * uploaded into Verite memory through the RISC bootstrap.  Returns false
+ * when there is nothing there to run, which is the normal state until the
+ * guest's driver has loaded.
+ */
+static bool stb_v2200_lle_start(STBTulsaV2200 *s)
+{
+    if (s->lle_running) {
+        return true;
+    }
+    if (!s->vram) {
+        return false;
+    }
+    v2200_pix_reset(&s->pix);
+    s->pix.read = stb_v2200_core_read;
+    s->pix.write = stb_v2200_core_write;
+    s->pix.opaque = s;
+
+    /*
+     * No FIFO callbacks: DispatchLoop tests FIFOInRdy in Flag before it
+     * ever reads, so a core with none simply waits instead of halting.
+     * Commands still arrive through the display list; wiring the real
+     * command FIFO aperture is the next step.
+     */
+    s->core.read = stb_v2200_core_read;
+    s->core.write = stb_v2200_core_write;
+    s->core.pix_write = stb_v2200_pix_spr_cb;
+    s->core.engine = stb_v2200_engine_cb;
+    s->core.opaque = s;
+    v2200_reset(&s->core, STB_V2200_UCODE_ENTRY);
+
+    s->lle_running = true;
+    return true;
+}
+
+/*
+ * Run the card's own microcode over a submitted list.  The interrupt tail
+ * reads the list pointer out of Verite memory at 0x6cf8, which the host
+ * normally writes through the cmdptr aperture - that aperture overlays
+ * this address, so the value never reaches the backing store and has to
+ * be published here before the microcode can see it.
+ */
+static void stb_v2200_lle_list(STBTulsaV2200 *s, uint32_t addr)
+{
+    uint64_t budget = STB_V2200_LLE_BUDGET;
+
+    if (!stb_v2200_lle_start(s)) {
+        return;
+    }
+    stl_be_p(s->vram + STB_V2200_CMD_CURRENT, addr);
+
+    /* Arm the field interrupt DispatchLoop is waiting on. */
+    s->core.reg[V2200_R_RISCINTR] |= V2200_INTR_VERT | V2200_INTR_RISCINTR;
+
+    while (budget-- && !s->core.halted) {
+        if (!v2200_step(&s->core)) {
+            break;
+        }
+    }
+    if (s->core.halted) {
+        qemu_log_mask(LOG_UNIMP,
+                      "stb-tulsa: v2200(%s) microcode halted at %08x: %s\n",
+                      s->role ?: "?", s->core.halt_pc,
+                      s->core.halt_reason ?: "?");
+        s->lle_running = false;
+    }
+}
+
 static void stb_v2200_decode_list(STBTulsaV2200 *s, uint32_t addr)
 {
+    if (s->lle) {
+        stb_v2200_lle_list(s, addr);
+        return;
+    }
     stb_v2200_run_list(s, addr, false);
 }
 
@@ -2063,6 +2200,7 @@ static void stb_v2200_reset_hold(Object *obj, ResetType type)
     s->cmd_current = 0;
     s->cmd_active = 0;
     s->lists_submitted = 0;
+    s->lle_running = false;
     if (s->vram) {
         /*
          * Zero is black in RGB but *saturated green* in UYVY, where black is
@@ -2464,6 +2602,7 @@ static const Property stb_v2200_properties[] = {
     DEFINE_PROP_STRING("role", STBTulsaV2200, role),
     DEFINE_PROP_BOOL("mmio-trace", STBTulsaV2200, mmio_trace, true),
     DEFINE_PROP_BOOL("alpha-invert", STBTulsaV2200, alpha_invert, false),
+    DEFINE_PROP_BOOL("lle", STBTulsaV2200, lle, false),
 };
 
 static void stb_v2200_class_init(ObjectClass *klass, const void *data)
@@ -3044,6 +3183,7 @@ static void stb_tulsa_realize(PCIDevice *dev, Error **errp)
      */
     qdev_prop_set_int32(DEVICE(&s->rgb), "addr", STB_TULSA_DEVFN_V2200RGB);
     qdev_prop_set_string(DEVICE(&s->rgb), "role", "rgb");
+    qdev_prop_set_bit(DEVICE(&s->rgb), "lle", s->lle);
     DEVICE(&s->rgb)->id = g_strdup("tulsa-rgb");
     if (!qdev_realize(DEVICE(&s->rgb), BUS(sec), errp)) {
         return;
@@ -3051,6 +3191,7 @@ static void stb_tulsa_realize(PCIDevice *dev, Error **errp)
 
     qdev_prop_set_int32(DEVICE(&s->yuv), "addr", STB_TULSA_DEVFN_V2200YUV);
     qdev_prop_set_string(DEVICE(&s->yuv), "role", "yuv");
+    qdev_prop_set_bit(DEVICE(&s->yuv), "lle", s->lle);
     DEVICE(&s->yuv)->id = g_strdup("tulsa-yuv");
     if (!qdev_realize(DEVICE(&s->yuv), BUS(sec), errp)) {
         return;
@@ -3107,6 +3248,13 @@ static const Property stb_tulsa_properties[] = {
     DEFINE_PROP_UINT32("dram-size", STBTulsa, dram_size, 8 * MiB),
     DEFINE_PROP_UINT32("notify-delay-ms", STBTulsa, notify_delay_ms, 10),
     DEFINE_PROP_BOOL("vertical-doorbell", STBTulsa, vertical_doorbell, true),
+    /*
+     * Run the card's own microcode on the V2200 interpreter instead of
+     * the HLE display-list reader.  Off by default: the HLE path is what
+     * puts a picture on the console today, and the LLE work exists to
+     * make that path redundant rather than to replace it before it can.
+     */
+    DEFINE_PROP_BOOL("lle", STBTulsa, lle, false),
     DEFINE_PROP_STRING("video-file", STBTulsa, video_file),
     DEFINE_PROP_STRING("video-listen", STBTulsa, video_listen),
 };

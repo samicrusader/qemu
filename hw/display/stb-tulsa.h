@@ -29,6 +29,8 @@
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "ui/surface.h"
+#include "stb-v2200.h"
+#include "stb-v2200-pix.h"
 
 /* None of these are in pci_ids.h. */
 #define PCI_VENDOR_ID_STB               0x10b4
@@ -464,6 +466,15 @@ typedef struct QEMU_PACKED {
 #define STB_V2200_FFCMD_LINES  0x1c
 
 #define STB_V2200_CMD_CURRENT 0x6cf8  /* host writes the list it submitted */
+
+/*
+ * The microcode's ELF entry point, and how many instructions one
+ * submitted list is allowed before the model gives up on it.  A field's
+ * worth of real work is a few thousand; the ceiling is only here so a
+ * microcode that spins cannot wedge the whole VM.
+ */
+#define STB_V2200_UCODE_ENTRY 0x1800
+#define STB_V2200_LLE_BUDGET  (4u * 1000 * 1000)
 #define STB_V2200_CMD_ACTIVE  0x6cfc  /* microcode publishes what it retired */
 #define STB_V2200_SLOTS       16
 #define STB_V2200_SLOT_DWORDS 32
@@ -678,6 +689,19 @@ struct STBTulsaV2200 {
     uint32_t rf[STB_V2200_RF_REGS];     /* the core's register file   */
     uint32_t risc_pc;                   /* last jump target           */
     uint8_t  rf_sel;                    /* register selected for readRF */
+    /*
+     * The low-level cores.  `lle` picks between the HLE display-list
+     * interpreter above - which reads the slots in C and is what has been
+     * driving the console - and running the card's own microcode through
+     * the V2200 RISC interpreter.  HLE is the default because it works;
+     * the LLE path is the one that will eventually make the HLE path
+     * unnecessary.
+     */
+    bool         lle;
+    bool         lle_running;      /* the microcode has been entered      */
+    V2200Core    core;
+    V2200Pix     pix;
+
     uint32_t cmd_current;   /* shadow of the submit doorbell  */
     uint32_t cmd_active;    /* shadow of the retire pointer   */
     uint32_t lists_submitted;
@@ -738,6 +762,7 @@ struct STBTulsa {
     uint32_t dram_size;
     uint32_t notify_delay_ms;
     bool     vertical_doorbell;
+    bool     lle;                 /* propagated to both V2200 children    */
     char    *video_file;        /* forwarded to the SAA7146, section 82 */
     char    *video_listen;      /* likewise, the live socket             */
 };
