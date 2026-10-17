@@ -151,6 +151,15 @@ typedef struct I960Core {
     I960RegSet  cache[I960_NFRAMES];
     unsigned    depth;
 
+    /*
+     * Interrupt table base.  Normally taken from the PRCB, which the
+     * board ROM builds; this firmware puts its table at 0 - it writes a
+     * handler to absolute 0x34, which is entry 0x24 + (12-8)*4, i.e.
+     * vector 12, and then enables bit 12 of the mask register.
+     */
+    uint32_t    intbase;
+    bool        irq_enabled;
+
     uint64_t    icount;
 } I960Core;
 
@@ -184,6 +193,22 @@ const char *i960_reg_name(unsigned r);
  * plausible and is wrong, which is worse than stopping.
  */
 bool i960_step(I960Core *c);
+
+/*
+ * Deliver an interrupt.  Returns false if the vector has no handler, so
+ * a missing entry is a visible event rather than a jump to zero.
+ *
+ * The frame goes on the current stack rather than a separate interrupt
+ * stack: the i960 only switches stacks when the interrupt arrives in user
+ * mode, and this firmware runs supervisor throughout.
+ *
+ * The interrupt record's exact layout is not documented here and nothing
+ * in this firmware reads it - the handler at 0xa02e8e6c takes the
+ * interrupted address from RIP (`mov rip, r5`), not from the record.  So
+ * RIP is what matters and is set faithfully; the record is written in a
+ * self-consistent layout purely so the matching ret can undo it.
+ */
+bool i960_interrupt(I960Core *c, unsigned vector);
 
 /*
  * Register windows.

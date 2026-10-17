@@ -628,12 +628,32 @@ static bool do_ret(I960Core *c)
     unsigned type = pfp & 0x7;
     int i;
 
+    if (type == 7) {                                /* interrupt return */
+        uint32_t saved_ac, saved_ip;
+        if (!rd32m(c, c->reg[I960_FP] - 12, &saved_ac) ||
+            !rd32m(c, c->reg[I960_FP] - 8, &saved_ip)) {
+            return false;
+        }
+        if (c->depth) {
+            memcpy(c->reg, c->cache[--c->depth].reg,
+                   sizeof(c->cache[0].reg));
+        } else {
+            for (i = 0; i < 16; i++) {
+                if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
+                    return false;
+                }
+            }
+        }
+        c->ac = saved_ac;
+        c->reg[I960_FP] = newfp;
+        c->ip = saved_ip;
+        return true;
+    }
     if (type != 0) {
         /*
-         * Fault, supervisor and interrupt returns restore more than the
-         * register set and are not modelled yet.  Stop loudly: silently
-         * doing a local return here would corrupt the trace from the
-         * first interrupt onwards.
+         * Fault and supervisor returns restore more than the register set
+         * and are not modelled yet.  Stop loudly: silently doing a local
+         * return would corrupt the trace from that point on.
          */
         c->halt_reason = "ret with non-local return type";
         c->halt_ip = c->ip;
@@ -653,6 +673,44 @@ static bool do_ret(I960Core *c)
     }
     c->reg[I960_FP] = newfp;
     c->ip = rip;
+    return true;
+}
+
+bool i960_interrupt(I960Core *c, unsigned vector)
+{
+    uint32_t oldfp = c->reg[I960_FP];
+    uint32_t newfp = (c->reg[I960_SP] + (I960_FRAME_ALIGN - 1)) &
+                     ~(uint32_t)(I960_FRAME_ALIGN - 1);
+    uint32_t handler = 0, saved_ip = c->ip;
+    I960RegSet *s;
+
+    if (vector < 8 || vector > 255) {
+        return false;
+    }
+    if (!rd32m(c, c->intbase + 0x24 + (uint32_t)(vector - 8) * 4, &handler) ||
+        handler == 0) {
+        return false;
+    }
+
+    if (c->depth == I960_NFRAMES && !spill_oldest(c)) {
+        return false;
+    }
+    s = &c->cache[c->depth++];
+    s->fp = oldfp;
+    memcpy(s->reg, c->reg, sizeof(s->reg));
+
+    /* Record, for the matching ret only. */
+    if (!wr32m(c, newfp - 16, vector) ||
+        !wr32m(c, newfp - 12, c->ac) ||
+        !wr32m(c, newfp - 8, saved_ip)) {
+        return false;
+    }
+
+    c->reg[I960_R0]  = (oldfp & ~(uint32_t)0x7) | 0x7;   /* interrupt ret */
+    c->reg[I960_RIP] = saved_ip;      /* what the handler actually reads */
+    c->reg[I960_FP]  = newfp;
+    c->reg[I960_SP]  = newfp + I960_FRAME_ALIGN;
+    c->ip = handler;
     return true;
 }
 
