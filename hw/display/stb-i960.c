@@ -639,6 +639,30 @@ static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
         c->halt_word = oldfp;
         return false;
     }
+    /*
+     * RIP belongs to the CALLER, not the callee.
+     *
+     * `call` stores the return address in r2 of the register set that is
+     * current when it executes - the caller's - and that set is then
+     * cached and spilled with the return address in it.  `ret` restores
+     * the previous set and only then takes IP from its r2.  So RIP is
+     * written here, BEFORE the snapshot, and the new frame's own r2 means
+     * nothing until it makes a call of its own.
+     *
+     * An earlier version had this the other way round, giving the return
+     * address to the callee and reading IP from the pre-restore r2.  That
+     * is self-consistent for ordinary calls, which is why it survived
+     * 200,000 instructions, and it is wrong: it loses by exactly one
+     * frame whenever software builds or edits a frame by hand.  Both
+     * places this firmware does that then misbehave - the type-7 task
+     * start (TCT_Build_Task_Stack puts the task entry in the inner save
+     * area's RIP) and the context switch (TCT_Control_To_Thread patches
+     * [PFP+8] with 0xa02e974c, the mirror of its own register save, and
+     * rets) - and the switch instead resumed at the save prologue with
+     * stale globals.
+     */
+    c->reg[I960_RIP] = retaddr;
+
     s = &c->cache[c->depth++];
     s->fp = oldfp;
     s->is_irq = false;
@@ -659,20 +683,68 @@ static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
         }
     }
 
-    /*
-     * PFP, SP and RIP describe the frame you are IN, so they belong to
-     * the NEW register set and must be written after the caller's set has
-     * been saved.  Writing RIP first overwrites the caller's own return
-     * address with the address after this call, and the caller then
-     * returns to itself - which is precisely what happened: a ret
-     * executing twice at the same address and then branching to zero.
-     */
-    c->reg[I960_RIP] = retaddr;
+    /* PFP and SP describe the frame you are IN: the new one. */
     c->reg[I960_R0] = oldfp;          /* PFP, return type 000 = local */
     c->reg[I960_FP] = newfp;
     c->reg[I960_SP] = newfp + 64;      /* past the register save area */
     c->ip = target;
     flog(c, 'c', retaddr - 4, oldfp, retaddr, newfp, false);
+    return true;
+}
+
+/*
+ * Restoring a register set on `ret`.
+ *
+ * The cache is write-through (see do_call), so the copy in the frame's
+ * memory image is always complete and always current: a cached set belongs
+ * to a suspended frame, and a suspended frame is not executing, so nothing
+ * can have changed it since the call wrote it out.  **Memory is therefore
+ * authoritative and the cache is only a shortcut**, valid exactly when its
+ * tag is the frame being returned to.
+ *
+ * That is not a micro-optimisation, it is the whole context switch.
+ * Nucleus PLUS resumes a task by overwriting PFP with a frame address it
+ * chose, patching that frame's RIP slot in memory, and executing `ret`
+ * (TCT_Control_To_Thread, 0xa02e96f0-0xa02e9748).  The frame it names was
+ * never pushed by any call on this path, so a LIFO pop restores the wrong
+ * sixteen registers and the task resumes with another function's locals -
+ * which is precisely what happened: the switch landed in the TCB writer
+ * with its thread pointer holding 4.
+ *
+ * On a mismatch the cache is discarded entirely rather than popped.  The
+ * frames it holds are no longer on the return path - that is what a switch
+ * means - and every one of them is already in memory, so dropping them
+ * loses nothing and keeps a stale tag from matching a later frame that
+ * happens to reuse the address.
+ */
+static bool restore_set(I960Core *c, uint32_t newfp)
+{
+    if (c->depth && c->cache[c->depth - 1].fp == newfp) {
+        c->depth--;
+        memcpy(c->reg, c->cache[c->depth].reg, sizeof(c->cache[0].reg));
+        return true;
+    }
+    if (c->depth) {
+        c->tag_mismatches++;
+        c->last_mem_restore_tag = c->cache[c->depth - 1].fp;
+        c->depth = 0;                       /* the chain moved under us */
+    }
+    return false;
+}
+
+static bool restore_from_memory(I960Core *c, uint32_t newfp)
+{
+    int i;
+
+    c->mem_restores++;
+    c->last_mem_restore_ip = c->ip;
+    c->last_mem_restore_fp = newfp;
+    c->last_mem_restore_depth = c->depth;
+    for (i = 0; i < 16; i++) {
+        if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -683,7 +755,6 @@ static bool do_ret(I960Core *c)
     uint32_t newfp = pfp & ~(uint32_t)(I960_FRAME_ALIGN - 1);
     unsigned type = pfp & 0x7;
     bool used_cache = false;
-    int i;
 
     if (pfp == 0) {
         /*
@@ -710,15 +781,8 @@ static bool do_ret(I960Core *c)
          * No cache entry is required: the kernel hand-builds these frames
          * to start a task, and such a frame was never pushed by anything.
          */
-        if (c->depth) {
-            memcpy(c->reg, c->cache[--c->depth].reg,
-                   sizeof(c->cache[0].reg));
-        } else {
-            for (i = 0; i < 16; i++) {
-                if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
-                    return false;
-                }
-            }
+        if (!restore_set(c, newfp) && !restore_from_memory(c, newfp)) {
+            return false;
         }
         c->ac = saved_ac;
         c->pc = saved_pc;
@@ -752,30 +816,13 @@ static bool do_ret(I960Core *c)
      * it is where a spill has to be written, and a mismatch is counted so
      * genuine drift is still visible.
      */
-    used_cache = c->depth != 0;
-    if (c->depth) {
-        I960RegSet *s = &c->cache[--c->depth];
-        if (s->fp != newfp) {
-            c->tag_mismatches++;
-            c->last_mem_restore_ip = c->ip;
-            c->last_mem_restore_fp = newfp;
-            c->last_mem_restore_tag = s->fp;
-        }
-        memcpy(c->reg, s->reg, sizeof(s->reg));
-    } else {
-        c->mem_restores++;
-        c->last_mem_restore_ip = c->ip;
-        c->last_mem_restore_fp = newfp;
-        c->last_mem_restore_depth = c->depth;
-        for (i = 0; i < 16; i++) {
-            if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
-                return false;
-            }
-        }
+    used_cache = restore_set(c, newfp);
+    if (!used_cache && !restore_from_memory(c, newfp)) {
+        return false;
     }
     c->reg[I960_FP] = newfp;
-    c->ip = rip;
-    flog(c, 'r', c->halt_ip, pfp, rip, newfp, used_cache);
+    c->ip = c->reg[I960_RIP];       /* the restored frame's return address */
+    flog(c, 'r', rip, pfp, c->ip, newfp, used_cache);
     return true;
 }
 

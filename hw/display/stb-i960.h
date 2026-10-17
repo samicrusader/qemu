@@ -152,6 +152,21 @@ typedef bool (*I960SyscallFn)(void *opaque, struct I960Core *c, unsigned index);
 #define I960_FRAME_ALIGN 16
 #define I960_NFRAMES     8      /* on-chip local register sets */
 
+/*
+ * RIP (r2) belongs to the CALLER.  `call` writes the return address into
+ * the register set that is current when it executes, that set is then
+ * cached and spilled with the return address in it, and `ret` restores
+ * the previous set and only then takes IP from its r2.
+ *
+ * The opposite arrangement - return address to the callee, IP from r2
+ * before the restore - is self-consistent for ordinary calls and wrong by
+ * exactly one frame the moment software builds or edits a frame by hand.
+ * This firmware does that twice: TCT_Build_Task_Stack puts a task's entry
+ * point in the inner save area's RIP, and TCT_Control_To_Thread patches
+ * [PFP+8] before returning into a suspended task.  Both are the i960's
+ * documented idiom for a context switch, and both need this.
+ */
+
 typedef struct {
     uint32_t fp;                /* the frame these locals belong to */
     uint32_t reg[16];
