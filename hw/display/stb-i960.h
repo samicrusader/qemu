@@ -36,6 +36,21 @@
 
 #define I960_NREG 32
 
+/*
+ * Process controls.  Priority is bits 20:16, and it is the whole of the
+ * interrupt mask on this architecture - there is no separate disable bit.
+ * An interrupt is taken only when its own priority exceeds the current
+ * one, priority 31 being the exception that always lands.
+ */
+#define I960_PC_PRIO_SHIFT 16
+#define I960_PC_PRIO_MASK  0x001f0000u
+#define I960_PC_STATE      0x00002000u
+
+static inline unsigned i960_pc_priority(uint32_t pc)
+{
+    return (pc & I960_PC_PRIO_MASK) >> I960_PC_PRIO_SHIFT;
+}
+
 /* Arithmetic-controls condition code, AC bits 2:0. */
 #define I960_CC_MASK      0x7
 #define I960_CC_FALSE     0x0
@@ -128,6 +143,16 @@ typedef bool (*I960SyscallFn)(void *opaque, struct I960Core *c, unsigned index);
 typedef struct {
     uint32_t fp;                /* the frame these locals belong to */
     uint32_t reg[16];
+    /*
+     * Interrupt state, when this set was pushed by an interrupt rather
+     * than a call.  It lives here instead of in guest memory because
+     * nothing in the firmware reads it - the handler takes the
+     * interrupted address from RIP - and the architectural record would
+     * sit at newfp-16, which overlaps the previous frame's save area and
+     * corrupted a PFP into a PC value when it was written there.
+     */
+    uint32_t saved_ip, saved_ac, saved_pc;
+    bool     is_irq;
 } I960RegSet;
 
 typedef struct I960Core {
@@ -195,8 +220,10 @@ const char *i960_reg_name(unsigned r);
 bool i960_step(I960Core *c);
 
 /*
- * Deliver an interrupt.  Returns false if the vector has no handler, so
- * a missing entry is a visible event rather than a jump to zero.
+ * Deliver an interrupt, or say why not.  Masked and unhandled are
+ * genuinely different answers - masked means try again once the priority
+ * drops, unhandled means the firmware never installed anything - and
+ * collapsing them into one false makes a routine mask look like a fault.
  *
  * The frame goes on the current stack rather than a separate interrupt
  * stack: the i960 only switches stacks when the interrupt arrives in user
@@ -208,7 +235,14 @@ bool i960_step(I960Core *c);
  * RIP is what matters and is set faithfully; the record is written in a
  * self-consistent layout purely so the matching ret can undo it.
  */
-bool i960_interrupt(I960Core *c, unsigned vector);
+typedef enum {
+    I960_IRQ_DELIVERED = 0,
+    I960_IRQ_MASKED,        /* priority too low - the caller holds it pending */
+    I960_IRQ_NO_HANDLER,    /* the interrupt table entry is zero */
+    I960_IRQ_FAULT,         /* a memory access during delivery failed */
+} I960IrqResult;
+
+I960IrqResult i960_interrupt(I960Core *c, unsigned vector);
 
 /*
  * Register windows.

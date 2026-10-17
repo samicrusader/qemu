@@ -581,11 +581,26 @@ static bool effa(I960Core *c, const I960Insn *in, uint32_t *out)
  * call/ret.  See the register-window note in stb-i960.h for why the local
  * set is always spilled rather than cached.
  */
+/*
+ * A frame pointer this low is never real.  The i960 interrupt table lives
+ * at the bottom of memory, so a 64-byte register spill to a small FP
+ * writes straight over the vectors and the failure resurfaces thousands
+ * of instructions later as "no handler installed" - a symptom with no
+ * visible connection to its cause.  Refuse it instead.
+ */
+#define I960_MIN_FRAME 0x1000u
+
 static bool spill_oldest(I960Core *c)
 {
     I960RegSet *s = &c->cache[0];
     int i;
 
+    if (s->fp < I960_MIN_FRAME) {
+        c->halt_reason = "register spill to an implausible frame pointer";
+        c->halt_ip = c->ip;
+        c->halt_word = s->fp;
+        return false;
+    }
     for (i = 0; i < 16; i++) {
         if (!wr32m(c, s->fp + (uint32_t)i * 4, s->reg[i])) {
             return false;
@@ -604,15 +619,29 @@ static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
                      ~(uint32_t)(I960_FRAME_ALIGN - 1);
     I960RegSet *s;
 
-    c->reg[I960_RIP] = retaddr;
-
     if (c->depth == I960_NFRAMES && !spill_oldest(c)) {
+        return false;
+    }
+    if (oldfp < I960_MIN_FRAME) {
+        c->halt_reason = "call from an implausible frame pointer";
+        c->halt_ip = c->ip;
+        c->halt_word = oldfp;
         return false;
     }
     s = &c->cache[c->depth++];
     s->fp = oldfp;
+    s->is_irq = false;
     memcpy(s->reg, c->reg, sizeof(s->reg));
 
+    /*
+     * PFP, SP and RIP describe the frame you are IN, so they belong to
+     * the NEW register set and must be written after the caller's set has
+     * been saved.  Writing RIP first overwrites the caller's own return
+     * address with the address after this call, and the caller then
+     * returns to itself - which is precisely what happened: a ret
+     * executing twice at the same address and then branching to zero.
+     */
+    c->reg[I960_RIP] = retaddr;
     c->reg[I960_R0] = oldfp;          /* PFP, return type 000 = local */
     c->reg[I960_FP] = newfp;
     c->reg[I960_SP] = newfp + I960_FRAME_ALIGN;
@@ -629,24 +658,24 @@ static bool do_ret(I960Core *c)
     int i;
 
     if (type == 7) {                                /* interrupt return */
-        uint32_t saved_ac, saved_ip;
-        if (!rd32m(c, c->reg[I960_FP] - 12, &saved_ac) ||
-            !rd32m(c, c->reg[I960_FP] - 8, &saved_ip)) {
+        I960RegSet *s;
+        if (!c->depth || !c->cache[c->depth - 1].is_irq) {
+            /*
+             * The set that would restore this was spilled, or was not
+             * pushed by an interrupt at all.  Either way the saved IP is
+             * gone and continuing would be invention.
+             */
+            c->halt_reason = "interrupt return with no matching frame";
+            c->halt_ip = c->ip;
+            c->halt_word = pfp;
             return false;
         }
-        if (c->depth) {
-            memcpy(c->reg, c->cache[--c->depth].reg,
-                   sizeof(c->cache[0].reg));
-        } else {
-            for (i = 0; i < 16; i++) {
-                if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
-                    return false;
-                }
-            }
-        }
-        c->ac = saved_ac;
+        s = &c->cache[--c->depth];
+        memcpy(c->reg, s->reg, sizeof(s->reg));
+        c->ac = s->saved_ac;
+        c->pc = s->saved_pc;
         c->reg[I960_FP] = newfp;
-        c->ip = saved_ip;
+        c->ip = s->saved_ip;
         return true;
     }
     if (type != 0) {
@@ -661,8 +690,15 @@ static bool do_ret(I960Core *c)
         return false;
     }
 
-    if (c->depth) {
-        /* The set is still on chip; FP is irrelevant to finding it. */
+    /*
+     * The cache is tagged by frame pointer, and the tag has to be checked.
+     * A plain LIFO pop assumes every ret matches a call, but this firmware
+     * branches between functions - `b 0xa02e4fa8` into the kernel is one -
+     * so a ret can unwind a frame no call ever pushed.  Popping blindly
+     * then hands back some other function's locals, and the damage shows
+     * up as a nonsense PFP much later.
+     */
+    if (c->depth && c->cache[c->depth - 1].fp == newfp) {
         memcpy(c->reg, c->cache[--c->depth].reg, sizeof(c->cache[0].reg));
     } else {
         for (i = 0; i < 16; i++) {
@@ -676,42 +712,55 @@ static bool do_ret(I960Core *c)
     return true;
 }
 
-bool i960_interrupt(I960Core *c, unsigned vector)
+I960IrqResult i960_interrupt(I960Core *c, unsigned vector)
 {
     uint32_t oldfp = c->reg[I960_FP];
     uint32_t newfp = (c->reg[I960_SP] + (I960_FRAME_ALIGN - 1)) &
                      ~(uint32_t)(I960_FRAME_ALIGN - 1);
     uint32_t handler = 0, saved_ip = c->ip;
+    unsigned prio = vector >> 3;
     I960RegSet *s;
 
     if (vector < 8 || vector > 255) {
-        return false;
+        return I960_IRQ_NO_HANDLER;
     }
-    if (!rd32m(c, c->intbase + 0x24 + (uint32_t)(vector - 8) * 4, &handler) ||
-        handler == 0) {
-        return false;
+    /*
+     * Priority is the mask.  The firmware sets PC.priority to 31 as its
+     * first act, so anything that does not check this delivers interrupts
+     * the real core would hold pending - and produces a trace that looks
+     * fine and is not.
+     */
+    if (prio != 31 && prio <= i960_pc_priority(c->pc)) {
+        return I960_IRQ_MASKED;
+    }
+    if (!rd32m(c, c->intbase + 0x24 + (uint32_t)(vector - 8) * 4, &handler)) {
+        return I960_IRQ_FAULT;
+    }
+    if (handler == 0) {
+        return I960_IRQ_NO_HANDLER;
     }
 
     if (c->depth == I960_NFRAMES && !spill_oldest(c)) {
-        return false;
+        return I960_IRQ_FAULT;
     }
     s = &c->cache[c->depth++];
     s->fp = oldfp;
     memcpy(s->reg, c->reg, sizeof(s->reg));
 
-    /* Record, for the matching ret only. */
-    if (!wr32m(c, newfp - 16, vector) ||
-        !wr32m(c, newfp - 12, c->ac) ||
-        !wr32m(c, newfp - 8, saved_ip)) {
-        return false;
-    }
+    s->is_irq   = true;
+    s->saved_ip = saved_ip;
+    s->saved_ac = c->ac;
+    s->saved_pc = c->pc;
+
+    c->pc = (c->pc & ~I960_PC_PRIO_MASK) | I960_PC_STATE |
+            ((uint32_t)prio << I960_PC_PRIO_SHIFT);
 
     c->reg[I960_R0]  = (oldfp & ~(uint32_t)0x7) | 0x7;   /* interrupt ret */
     c->reg[I960_RIP] = saved_ip;      /* what the handler actually reads */
     c->reg[I960_FP]  = newfp;
     c->reg[I960_SP]  = newfp + I960_FRAME_ALIGN;
     c->ip = handler;
-    return true;
+    return I960_IRQ_DELIVERED;
 }
 
 /* Branch condition against AC.cc, for both CTRL and COBR forms. */
