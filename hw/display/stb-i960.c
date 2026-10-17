@@ -581,21 +581,37 @@ static bool effa(I960Core *c, const I960Insn *in, uint32_t *out)
  * call/ret.  See the register-window note in stb-i960.h for why the local
  * set is always spilled rather than cached.
  */
+static bool spill_oldest(I960Core *c)
+{
+    I960RegSet *s = &c->cache[0];
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        if (!wr32m(c, s->fp + (uint32_t)i * 4, s->reg[i])) {
+            return false;
+        }
+    }
+    memmove(&c->cache[0], &c->cache[1],
+            sizeof(c->cache[0]) * (I960_NFRAMES - 1));
+    c->depth--;
+    return true;
+}
+
 static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
 {
     uint32_t oldfp = c->reg[I960_FP];
     uint32_t newfp = (c->reg[I960_SP] + (I960_FRAME_ALIGN - 1)) &
                      ~(uint32_t)(I960_FRAME_ALIGN - 1);
-    int i;
+    I960RegSet *s;
 
     c->reg[I960_RIP] = retaddr;
 
-    /* Spill the caller's locals into the caller's own frame. */
-    for (i = 0; i < 16; i++) {
-        if (!wr32m(c, oldfp + (uint32_t)i * 4, c->reg[i])) {
-            return false;
-        }
+    if (c->depth == I960_NFRAMES && !spill_oldest(c)) {
+        return false;
     }
+    s = &c->cache[c->depth++];
+    s->fp = oldfp;
+    memcpy(s->reg, c->reg, sizeof(s->reg));
 
     c->reg[I960_R0] = oldfp;          /* PFP, return type 000 = local */
     c->reg[I960_FP] = newfp;
@@ -625,9 +641,14 @@ static bool do_ret(I960Core *c)
         return false;
     }
 
-    for (i = 0; i < 16; i++) {
-        if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
-            return false;
+    if (c->depth) {
+        /* The set is still on chip; FP is irrelevant to finding it. */
+        memcpy(c->reg, c->cache[--c->depth].reg, sizeof(c->cache[0].reg));
+    } else {
+        for (i = 0; i < 16; i++) {
+            if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
+                return false;
+            }
         }
     }
     c->reg[I960_FP] = newfp;
@@ -1018,9 +1039,32 @@ bool i960_step(I960Core *c)
             break;
         }
 
+        case 0x660:                                     /* calls    */
+            /*
+             * The service runs on the host side and returns here, so the
+             * only architectural effect modelled is that execution
+             * continues after the call.  A real calls would build a
+             * supervisor frame that the service's own ret unwinds; since
+             * the service never executes i960 instructions, there is no
+             * frame to unwind and synthesising one would only create
+             * state nothing reads.
+             */
+            if (!c->syscall || !c->syscall(c->opaque, c, a)) {
+                c->halt_reason = "unhandled supervisor call";
+                c->halt_ip = in->ip;
+                c->halt_word = a;
+                return false;
+            }
+            c->ip = next;
+            return true;
+
         case 0x5b4: c->ip = next; return true;          /* intdis   */
         case 0x5b5: c->ip = next; return true;          /* inten    */
-        case 0x66d: c->ip = next; return true;          /* flushreg */
+        case 0x66d:                                     /* flushreg */
+            while (c->depth) {
+                if (!spill_oldest(c)) { HALT(c, in, "flushreg spill"); }
+            }
+            c->ip = next; return true;
         case 0x66f: c->ip = next; return true;          /* syncf    */
 
         default:

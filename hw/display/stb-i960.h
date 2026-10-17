@@ -104,6 +104,32 @@ struct I960Core;
 typedef bool (*I960ReadFn)(void *opaque, uint32_t addr, void *buf, unsigned len);
 typedef bool (*I960WriteFn)(void *opaque, uint32_t addr, const void *buf, unsigned len);
 
+/*
+ * Supervisor call.  `calls` enters supervisor mode through the system
+ * procedure table, and on this board that table is built by the board ROM
+ * - a ceramic PLCC that has never been dumped.
+ *
+ * Rather than invent a table, the core hands the service index out here.
+ * The firmware only has four `calls` sites in 122 KB (indices 243, 245,
+ * 246 and 249), three of them identical trampolines, so answering four
+ * services is a far smaller problem than reproducing a ROM.  This is
+ * deliberately high-level emulation of the ROM sitting underneath
+ * low-level emulation of the firmware, and the seam is here so that it is
+ * obvious rather than buried.
+ *
+ * Return false for an index you do not answer: the core then stops rather
+ * than letting the firmware run on with a result it never received.
+ */
+typedef bool (*I960SyscallFn)(void *opaque, struct I960Core *c, unsigned index);
+
+#define I960_FRAME_ALIGN 64
+#define I960_NFRAMES     8      /* on-chip local register sets */
+
+typedef struct {
+    uint32_t fp;                /* the frame these locals belong to */
+    uint32_t reg[16];
+} I960RegSet;
+
 typedef struct I960Core {
     uint32_t    reg[I960_NREG];
     uint32_t    ip;
@@ -111,14 +137,19 @@ typedef struct I960Core {
     uint32_t    pc;           /* process controls                    */
     uint32_t    tc;           /* trace controls                      */
 
-    I960ReadFn  read;
-    I960WriteFn write;
-    void       *opaque;
+    I960ReadFn    read;
+    I960WriteFn   write;
+    I960SyscallFn syscall;
+    void         *opaque;
 
     /* Stop reason, set when step() returns false. */
     const char *halt_reason;
     uint32_t    halt_ip;
     uint32_t    halt_word;
+
+    /* On-chip local register sets, innermost last. */
+    I960RegSet  cache[I960_NFRAMES];
+    unsigned    depth;
 
     uint64_t    icount;
 } I960Core;
@@ -157,15 +188,23 @@ bool i960_step(I960Core *c);
 /*
  * Register windows.
  *
- * The real core keeps several local register sets in an on-chip cache and
- * spills them to the stack only when the cache overflows.  This model
- * always spills: `call` writes r0-r15 to the current frame and `ret`
- * reads them back.  That is observationally identical for software that
- * does not inspect the cache, and it makes `flushreg` a no-op, which is
- * exactly what flushreg means to such software.  Firmware that reads a
- * saved frame out of memory - which Nucleus PLUS does during a context
- * switch - sees the same bytes either way.
+ * An earlier version of this always spilled - `call` wrote r0-r15 to the
+ * current frame, `ret` read them back - on the argument that it was
+ * observationally identical for software that does not inspect the cache.
+ * That argument is wrong for this firmware, and the firmware says so:
+ * eleven instructions in it assign g15 (FP) directly, clustered in the
+ * Nucleus PLUS scheduler around 0xa02e98xx.
+ *
+ * Reassigning FP does not invalidate the on-chip sets.  A real `ret`
+ * restores the most recently pushed set from the cache and takes the new
+ * FP from PFP; it does not re-read memory at wherever FP now points.  The
+ * spill-only model read whichever bytes happened to be at the new FP -
+ * seeded image data - and the corruption surfaced as a bogus PFP about
+ * 200,000 instructions later, nowhere near its cause.
+ *
+ * So the cache is modelled properly: a LIFO of local register sets,
+ * spilled to their own frames only on overflow, and `flushreg` means
+ * something again.
  */
-#define I960_FRAME_ALIGN 64
 
 #endif /* STB_I960_H */
