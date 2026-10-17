@@ -829,7 +829,13 @@ static bool do_ret(I960Core *c)
 I960IrqResult i960_interrupt(I960Core *c, unsigned vector)
 {
     uint32_t oldfp = c->reg[I960_FP];
-    uint32_t newfp = (c->reg[I960_SP] + (I960_FRAME_ALIGN - 1)) &
+    /*
+     * An interrupt taken while PC.state says "executing" switches to the
+     * interrupt stack; a nested one, with the bit already set, stays put.
+     */
+    uint32_t stack = (c->isp && !(c->pc & I960_PC_STATE)) ? c->isp
+                                                          : c->reg[I960_SP];
+    uint32_t newfp = (stack + (I960_FRAME_ALIGN - 1)) &
                      ~(uint32_t)(I960_FRAME_ALIGN - 1);
     uint32_t handler = 0, saved_ip = c->ip;
     unsigned prio = vector >> 3;

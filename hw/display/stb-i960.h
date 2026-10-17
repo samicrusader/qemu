@@ -210,6 +210,22 @@ typedef struct I960Core {
     uint32_t    pc;           /* process controls                    */
     uint32_t    tc;           /* trace controls                      */
 
+    /*
+     * The interrupt stack.  A Jx taking an interrupt while PC.state says
+     * "executing" switches to the stack the PRCB names and builds the
+     * record and the handler's frame there; only a nested interrupt, with
+     * the state bit already set, stays on the stack it is on.  Allocating
+     * the record on the interrupted procedure's own stack instead looks
+     * harmless - the register set is cached and restored - but the record
+     * lands at newfp-16, and a procedure that reserved stack locals above
+     * its register save area has one of them exactly there.  That is how
+     * section 130's demux lost 2023 bytes: the field interrupt overwrote a
+     * local holding a PES payload length between the instruction that
+     * advanced the read pointer and the one that debited the counter.
+     * Zero means "no interrupt stack, use SP", which is the old behaviour.
+     */
+    uint32_t    isp;
+
     I960ReadFn    read;
     I960WriteFn   write;
     I960SyscallFn syscall;
