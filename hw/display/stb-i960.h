@@ -141,4 +141,31 @@ bool     i960_decode_buf(const uint8_t *p, size_t avail, uint32_t addr,
 
 const char *i960_reg_name(unsigned r);
 
+/* ------------------------------------------------------------------ */
+/* Execution                                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Execute one instruction.  Returns false and fills in halt_reason when
+ * the core cannot continue: an unimplemented opcode, a memory access the
+ * board model refused, or a reserved encoding.  It never guesses - a core
+ * that invents a result keeps running and produces a trace that looks
+ * plausible and is wrong, which is worse than stopping.
+ */
+bool i960_step(I960Core *c);
+
+/*
+ * Register windows.
+ *
+ * The real core keeps several local register sets in an on-chip cache and
+ * spills them to the stack only when the cache overflows.  This model
+ * always spills: `call` writes r0-r15 to the current frame and `ret`
+ * reads them back.  That is observationally identical for software that
+ * does not inspect the cache, and it makes `flushreg` a no-op, which is
+ * exactly what flushreg means to such software.  Firmware that reads a
+ * saved frame out of memory - which Nucleus PLUS does during a context
+ * switch - sees the same bytes either way.
+ */
+#define I960_FRAME_ALIGN 64
+
 #endif /* STB_I960_H */

@@ -478,3 +478,577 @@ void i960_reset(I960Core *c, uint32_t entry)
     c->halt_reason = NULL;
     c->icount = 0;
 }
+
+/* ================================================================== */
+/* Execution                                                          */
+/* ================================================================== */
+
+#define HALT(c, in, why) do {                                           \
+        (c)->halt_reason = (why);                                       \
+        (c)->halt_ip = (in)->ip;                                        \
+        (c)->halt_word = (in)->word0;                                   \
+        return false;                                                   \
+    } while (0)
+
+static bool rd32m(I960Core *c, uint32_t a, uint32_t *v)
+{
+    uint8_t b[4];
+    if (!c->read(c->opaque, a, b, 4)) {
+        return false;
+    }
+    *v = ld32(b);
+    return true;
+}
+
+static bool wr32m(I960Core *c, uint32_t a, uint32_t v)
+{
+    uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8),
+                     (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    return c->write(c->opaque, a, b, 4);
+}
+
+/* REG source operands: M1/M2 turn the 5-bit field into a literal 0-31. */
+static uint32_t s1(const I960Core *c, const I960Insn *in)
+{
+    return in->src1_lit ? in->src1 : c->reg[in->src1];
+}
+static uint32_t s2(const I960Core *c, const I960Insn *in)
+{
+    return in->src2_lit ? in->src2 : c->reg[in->src2];
+}
+
+/* Condition code, AC bits 2:0. */
+static void set_cc(I960Core *c, unsigned cc)
+{
+    c->ac = (c->ac & ~(uint32_t)I960_CC_MASK) | (cc & I960_CC_MASK);
+}
+
+static void cmp_set(I960Core *c, uint32_t a, uint32_t b, bool sgn)
+{
+    bool lt = sgn ? ((int32_t)a < (int32_t)b) : (a < b);
+    bool eq = (a == b);
+    set_cc(c, eq ? I960_CC_EQUAL : (lt ? I960_CC_LESS : I960_CC_GREATER));
+}
+
+/*
+ * Effective address.  `lda` uses this without touching memory, which is
+ * how the firmware materialises constants and frame offsets.
+ */
+static bool effa(I960Core *c, const I960Insn *in, uint32_t *out)
+{
+    uint32_t base = 0, idx = 0;
+
+    switch (in->am) {
+    case I960_AM_OFFSET:
+        *out = (uint32_t)in->disp;
+        return true;
+    case I960_AM_OFFSET_ABASE:
+        *out = c->reg[in->abase] + (uint32_t)in->disp;
+        return true;
+    case I960_AM_ABASE:
+        *out = c->reg[in->abase];
+        return true;
+    case I960_AM_IP_DISP:
+        /* Relative to the word after the two-word instruction. */
+        *out = in->ip + 8 + (uint32_t)in->disp;
+        return true;
+    case I960_AM_DISP:
+        *out = (uint32_t)in->disp;
+        return true;
+    case I960_AM_DISP_ABASE:
+        *out = c->reg[in->abase] + (uint32_t)in->disp;
+        return true;
+    case I960_AM_ABASE_INDEX:
+        base = c->reg[in->abase];
+        idx  = c->reg[in->index] << in->scale;
+        *out = base + idx;
+        return true;
+    case I960_AM_DISP_INDEX:
+        idx  = c->reg[in->index] << in->scale;
+        *out = (uint32_t)in->disp + idx;
+        return true;
+    case I960_AM_DISP_ABASE_INDEX:
+        base = c->reg[in->abase];
+        idx  = c->reg[in->index] << in->scale;
+        *out = base + idx + (uint32_t)in->disp;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * call/ret.  See the register-window note in stb-i960.h for why the local
+ * set is always spilled rather than cached.
+ */
+static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
+{
+    uint32_t oldfp = c->reg[I960_FP];
+    uint32_t newfp = (c->reg[I960_SP] + (I960_FRAME_ALIGN - 1)) &
+                     ~(uint32_t)(I960_FRAME_ALIGN - 1);
+    int i;
+
+    c->reg[I960_RIP] = retaddr;
+
+    /* Spill the caller's locals into the caller's own frame. */
+    for (i = 0; i < 16; i++) {
+        if (!wr32m(c, oldfp + (uint32_t)i * 4, c->reg[i])) {
+            return false;
+        }
+    }
+
+    c->reg[I960_R0] = oldfp;          /* PFP, return type 000 = local */
+    c->reg[I960_FP] = newfp;
+    c->reg[I960_SP] = newfp + I960_FRAME_ALIGN;
+    c->ip = target;
+    return true;
+}
+
+static bool do_ret(I960Core *c)
+{
+    uint32_t pfp = c->reg[I960_R0];
+    uint32_t rip = c->reg[I960_RIP];
+    uint32_t newfp = pfp & ~(uint32_t)(I960_FRAME_ALIGN - 1);
+    unsigned type = pfp & 0x7;
+    int i;
+
+    if (type != 0) {
+        /*
+         * Fault, supervisor and interrupt returns restore more than the
+         * register set and are not modelled yet.  Stop loudly: silently
+         * doing a local return here would corrupt the trace from the
+         * first interrupt onwards.
+         */
+        c->halt_reason = "ret with non-local return type";
+        c->halt_ip = c->ip;
+        c->halt_word = pfp;
+        return false;
+    }
+
+    for (i = 0; i < 16; i++) {
+        if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
+            return false;
+        }
+    }
+    c->reg[I960_FP] = newfp;
+    c->ip = rip;
+    return true;
+}
+
+/* Branch condition against AC.cc, for both CTRL and COBR forms. */
+static bool cond_true(const I960Core *c, unsigned mask)
+{
+    unsigned cc = c->ac & I960_CC_MASK;
+    return mask ? ((cc & mask) != 0) : (cc == 0);
+}
+
+bool i960_step(I960Core *c)
+{
+    I960Insn ins;
+    I960Insn *in = &ins;
+    uint32_t next, ea, a, b, r;
+
+    if (!i960_decode(c, c->ip, in)) {
+        c->halt_reason = "instruction fetch failed";
+        c->halt_ip = c->ip;
+        return false;
+    }
+    next = c->ip + in->len;
+    c->icount++;
+
+    switch (in->fmt) {
+
+    case I960_FMT_CTRL:
+        switch (in->opcode) {
+        case 0x08:                                  /* b   */
+            c->ip = in->target; return true;
+        case 0x09:                                  /* call */
+            return do_call(c, in->target, next);
+        case 0x0a:                                  /* ret */
+            return do_ret(c);
+        case 0x0b:                                  /* bal */
+            c->reg[30] = next;                      /* g14 */
+            c->ip = in->target; return true;
+        default:
+            if (in->opcode >= 0x10 && in->opcode <= 0x17) {
+                c->ip = cond_true(c, in->opcode & 7) ? in->target : next;
+                return true;
+            }
+            HALT(c, in, "unimplemented CTRL opcode");
+        }
+
+    case I960_FMT_COBR:
+        if (in->opcode >= 0x20 && in->opcode <= 0x27) {   /* test<cc> */
+            c->reg[in->srcdst] = cond_true(c, in->opcode & 7) ? 1 : 0;
+            c->ip = next;
+            return true;
+        }
+        if (in->opcode == 0x30 || in->opcode == 0x37) {   /* bbc / bbs */
+            uint32_t bit = s1(c, in) & 31;
+            bool set = (c->reg[in->src2] >> bit) & 1;
+            bool take = (in->opcode == 0x37) ? set : !set;
+            set_cc(c, take ? 0x2 : 0x0);
+            c->ip = take ? in->target : next;
+            return true;
+        }
+        if (in->opcode >= 0x31 && in->opcode <= 0x3f) {   /* cmp+branch */
+            bool sgn = in->opcode >= 0x38;
+            a = in->src1_lit ? in->srcdst : c->reg[in->srcdst];
+            b = c->reg[in->src2];
+            cmp_set(c, a, b, sgn);
+            c->ip = cond_true(c, in->opcode & 7) ? in->target : next;
+            return true;
+        }
+        HALT(c, in, "unimplemented COBR opcode");
+
+    case I960_FMT_MEM:
+        if (!effa(c, in, &ea)) {
+            HALT(c, in, "reserved MEM addressing mode");
+        }
+        switch (in->opcode) {
+        case 0x8c:                                  /* lda */
+            c->reg[in->srcdst] = ea; c->ip = next; return true;
+        case 0x84:                                  /* bx */
+            c->ip = ea; return true;
+        case 0x85:                                  /* balx */
+            c->reg[in->srcdst] = next; c->ip = ea; return true;
+        case 0x86:                                  /* callx */
+            return do_call(c, ea, next);
+        case 0x90:                                  /* ld */
+            if (!rd32m(c, ea, &c->reg[in->srcdst])) goto memfault;
+            c->ip = next; return true;
+        case 0x92:                                  /* st */
+            if (!wr32m(c, ea, c->reg[in->srcdst])) goto memfault;
+            c->ip = next; return true;
+        case 0x80: case 0xc0: {                     /* ldob / ldib */
+            uint8_t v;
+            if (!c->read(c->opaque, ea, &v, 1)) goto memfault;
+            c->reg[in->srcdst] = (in->opcode == 0xc0)
+                               ? (uint32_t)(int32_t)(int8_t)v : v;
+            c->ip = next; return true;
+        }
+        case 0x82: case 0xc2: {                     /* stob / stib */
+            uint8_t v = (uint8_t)c->reg[in->srcdst];
+            if (!c->write(c->opaque, ea, &v, 1)) goto memfault;
+            c->ip = next; return true;
+        }
+        case 0x88: case 0xc8: {                     /* ldos / ldis */
+            uint8_t t[2];
+            uint32_t v;
+            if (!c->read(c->opaque, ea, t, 2)) goto memfault;
+            v = (uint32_t)t[0] | ((uint32_t)t[1] << 8);
+            c->reg[in->srcdst] = (in->opcode == 0xc8)
+                               ? (uint32_t)(int32_t)(int16_t)v : v;
+            c->ip = next; return true;
+        }
+        case 0x8a: case 0xca: {                     /* stos / stis */
+            uint32_t v = c->reg[in->srcdst];
+            uint8_t t[2] = { (uint8_t)v, (uint8_t)(v >> 8) };
+            if (!c->write(c->opaque, ea, t, 2)) goto memfault;
+            c->ip = next; return true;
+        }
+        case 0x98: case 0xa0: case 0xb0: {          /* ldl / ldt / ldq */
+            int n = (in->opcode == 0x98) ? 2 : (in->opcode == 0xa0) ? 3 : 4;
+            for (int i = 0; i < n; i++) {
+                if (!rd32m(c, ea + (uint32_t)i * 4,
+                           &c->reg[(in->srcdst + i) & 31])) goto memfault;
+            }
+            c->ip = next; return true;
+        }
+        case 0x9a: case 0xa2: case 0xb2: {          /* stl / stt / stq */
+            int n = (in->opcode == 0x9a) ? 2 : (in->opcode == 0xa2) ? 3 : 4;
+            for (int i = 0; i < n; i++) {
+                if (!wr32m(c, ea + (uint32_t)i * 4,
+                           c->reg[(in->srcdst + i) & 31])) goto memfault;
+            }
+            c->ip = next; return true;
+        }
+        default:
+            HALT(c, in, "unimplemented MEM opcode");
+        }
+    memfault:
+        c->halt_reason = "memory access refused";
+        c->halt_ip = in->ip;
+        c->halt_word = ea;
+        return false;
+
+    case I960_FMT_REG:
+        a = s1(c, in);
+        b = s2(c, in);
+        switch (in->opcode) {
+        case 0x5cc: r = a; break;                       /* mov      */
+        case 0x590: r = b + a; break;                   /* addo     */
+        case 0x591: r = (uint32_t)((int32_t)b + (int32_t)a); break;
+        case 0x592: r = b - a; break;                   /* subo     */
+        case 0x593: r = (uint32_t)((int32_t)b - (int32_t)a); break;
+        case 0x581: r = b & a; break;                   /* and      */
+        case 0x582: r = b & ~a; break;                  /* andnot   */
+        case 0x587: r = b | a; break;                   /* or       */
+        case 0x58b: r = b | ~a; break;                  /* ornot    */
+        case 0x586: r = b ^ a; break;                   /* xor      */
+        case 0x588: r = ~(b | a); break;                /* nor      */
+        case 0x589: r = ~(b ^ a); break;                /* xnor     */
+        case 0x58e: r = ~(b & a); break;                /* nand     */
+        case 0x584: r = ~b & a; break;                  /* notand   */
+        case 0x58d: r = ~b | a; break;                  /* notor    */
+        case 0x58a: r = ~a; break;                      /* not      */
+        case 0x583: r = b | (1u << (a & 31)); break;    /* setbit   */
+        case 0x58c: r = b & ~(1u << (a & 31)); break;   /* clrbit   */
+        case 0x580: r = b ^ (1u << (a & 31)); break;    /* notbit   */
+        case 0x58f:                                     /* alterbit */
+            /* Sets or clears the bit according to AC.cc bit 1. */
+            r = (c->ac & 0x2) ? (b |  (1u << (a & 31)))
+                              : (b & ~(1u << (a & 31)));
+            break;
+        /*
+         * Shift counts are taken whole, not masked: the architecture
+         * defines a count above 31 as shifting the operand away, and the
+         * firmware relies on it.  Masking would silently turn a shift of
+         * 32 into a no-op.
+         */
+        case 0x598: r = (a > 31) ? 0 : (b >> a); break;             /* shro */
+        case 0x59c: r = (a > 31) ? 0 : (b << a); break;             /* shlo */
+        case 0x59e: r = (a > 31) ? 0 : (uint32_t)((int32_t)b << a); break;
+        case 0x59b: r = (a > 31) ? (uint32_t)((int32_t)b >> 31)
+                                 : (uint32_t)((int32_t)b >> a); break;
+        case 0x59d: {                                   /* rotate   */
+            unsigned n = a & 31;
+            r = n ? ((b << n) | (b >> (32 - n))) : b;
+            break;
+        }
+        case 0x701: r = b * a; break;                   /* mulo     */
+        case 0x741: r = (uint32_t)((int32_t)b * (int32_t)a); break;
+        case 0x70b: if (!a) { HALT(c, in, "divide by zero"); }
+            r = b / a; break;                           /* divo     */
+        case 0x74b: if (!a) { HALT(c, in, "divide by zero"); }
+            r = (uint32_t)((int32_t)b / (int32_t)a); break;
+        case 0x708: if (!a) { HALT(c, in, "divide by zero"); }
+            r = b % a; break;                           /* remo     */
+        case 0x748: if (!a) { HALT(c, in, "divide by zero"); }
+            r = (uint32_t)((int32_t)b % (int32_t)a); break;
+        case 0x749: if (!a) { HALT(c, in, "divide by zero"); }
+            r = (uint32_t)((int32_t)b - ((int32_t)b / (int32_t)a) * (int32_t)a);
+            break;                                      /* modi     */
+
+        /* Compares write only AC.cc. */
+        case 0x5a0: cmp_set(c, a, b, false); c->ip = next; return true;
+        case 0x5a1: cmp_set(c, a, b, true);  c->ip = next; return true;
+        case 0x594: cmp_set(c, a & 0xff, b & 0xff, false);
+            c->ip = next; return true;
+        case 0x595: cmp_set(c, (uint32_t)(int32_t)(int8_t)a,
+                            (uint32_t)(int32_t)(int8_t)b, true);
+            c->ip = next; return true;
+        case 0x596: cmp_set(c, a & 0xffff, b & 0xffff, false);
+            c->ip = next; return true;
+        case 0x597: cmp_set(c, (uint32_t)(int32_t)(int16_t)a,
+                            (uint32_t)(int32_t)(int16_t)b, true);
+            c->ip = next; return true;
+        case 0x5ae:                                     /* chkbit   */
+            set_cc(c, ((b >> (a & 31)) & 1) ? I960_CC_EQUAL : 0);
+            c->ip = next; return true;
+
+        case 0x641: {                                   /* scanbit  */
+            int i;
+            r = 0xffffffffu; set_cc(c, 0);
+            for (i = 31; i >= 0; i--) {
+                if (a & (1u << i)) { r = (uint32_t)i;
+                                     set_cc(c, I960_CC_EQUAL); break; }
+            }
+            break;
+        }
+        case 0x640: {                                   /* spanbit  */
+            int i;
+            r = 0xffffffffu; set_cc(c, 0);
+            for (i = 31; i >= 0; i--) {
+                if (!(a & (1u << i))) { r = (uint32_t)i;
+                                        set_cc(c, I960_CC_EQUAL); break; }
+            }
+            break;
+        }
+        case 0x650: {                                   /* modify   */
+            uint32_t mask = a, src = b;
+            r = (c->reg[in->srcdst] & ~mask) | (src & mask);
+            break;
+        }
+        /*
+         * Control registers.  PC, AC and TC are modelled as plain words:
+         * the firmware reads and writes them (priority, trace enables,
+         * interrupt state) long before anything depends on their side
+         * effects, so storing them faithfully is enough to keep going,
+         * and the effects can be added when something observes them.
+         *
+         * All three have the same shape - mask of 0 means read only.
+         */
+        case 0x655: {                                   /* modpc    */
+            uint32_t old = c->pc;
+            if (b) { c->pc = (c->reg[in->srcdst] & b) | (c->pc & ~b); }
+            r = old;
+            break;
+        }
+        case 0x645: {                                   /* modac    */
+            uint32_t old = c->ac;
+            if (a) { c->ac = (b & a) | (c->ac & ~a); }
+            r = old;
+            break;
+        }
+        case 0x654: {                                   /* modtc    */
+            uint32_t old = c->tc;
+            if (a) { c->tc = (b & a) | (c->tc & ~a); }
+            r = old;
+            break;
+        }
+
+        /*
+         * Cache and bus control.  There are no caches here and the board
+         * model has no notion of one, so these report "nothing cached"
+         * rather than pretending to flush something.
+         */
+        case 0x65b:                                     /* icctl    */
+        case 0x65c: r = 0; break;                       /* dcctl    */
+        case 0x658: r = 0; break;                       /* intctl   */
+        case 0x659: r = 0; break;                       /* sysctl   */
+        case 0x65d:                                     /* halt     */
+            c->halt_reason = "halt instruction";
+            c->halt_ip = in->ip;
+            c->halt_word = a;
+            return false;
+        case 0x66b:                                     /* mark     */
+        case 0x66c: c->ip = next; return true;          /* fmark    */
+
+        case 0x5ad: {                                   /* bswap    */
+            r = ((a & 0x000000ffu) << 24) | ((a & 0x0000ff00u) << 8) |
+                ((a & 0x00ff0000u) >> 8)  | ((a & 0xff000000u) >> 24);
+            break;
+        }
+        case 0x5ac: {                                   /* scanbyte  */
+            unsigned k;
+            set_cc(c, 0);
+            for (k = 0; k < 4; k++) {
+                if (((a >> (k * 8)) & 0xff) == ((b >> (k * 8)) & 0xff)) {
+                    set_cc(c, I960_CC_EQUAL);
+                    break;
+                }
+            }
+            c->ip = next; return true;
+        }
+        case 0x651: {                                   /* extract   */
+            uint32_t bitpos = a & 31, len = b;
+            uint32_t v = c->reg[in->srcdst] >> bitpos;
+            r = (len >= 32) ? v : (v & ((1u << len) - 1));
+            break;
+        }
+        case 0x5b0: {                                   /* addc      */
+            uint64_t t = (uint64_t)a + b + ((c->ac >> 1) & 1);
+            r = (uint32_t)t;
+            c->ac = (c->ac & ~0x6u) | (uint32_t)((t >> 32) & 1) << 1;
+            break;
+        }
+        case 0x5b2: {                                   /* subc      */
+            uint64_t t = (uint64_t)b - a - (1 - ((c->ac >> 1) & 1));
+            r = (uint32_t)t;
+            c->ac = (c->ac & ~0x6u) | (uint32_t)(((t >> 32) & 1) ^ 1) << 1;
+            break;
+        }
+        case 0x5a2: {                                   /* concmpo   */
+            if (!(c->ac & I960_CC_EQUAL)) { cmp_set(c, a, b, false); }
+            c->ip = next; return true;
+        }
+        case 0x5a3: {                                   /* concmpi   */
+            if (!(c->ac & I960_CC_EQUAL)) { cmp_set(c, a, b, true); }
+            c->ip = next; return true;
+        }
+        case 0x5a4: cmp_set(c, a, b, false); r = a + 1; break;  /* cmpinco */
+        case 0x5a5: cmp_set(c, a, b, true);  r = a + 1; break;  /* cmpinci */
+        case 0x5a6: cmp_set(c, a, b, false); r = a - 1; break;  /* cmpdeco */
+        case 0x5a7: cmp_set(c, a, b, true);  r = a - 1; break;  /* cmpdeci */
+
+        case 0x5dc: case 0x5ec: case 0x5fc: {           /* movl/t/q  */
+            int n = (in->opcode == 0x5dc) ? 2 : (in->opcode == 0x5ec) ? 3 : 4;
+            /* Source is a register group; literals are not legal here. */
+            for (int k = 0; k < n; k++) {
+                c->reg[(in->srcdst + k) & 31] =
+                    in->src1_lit ? 0 : c->reg[(in->src1 + k) & 31];
+            }
+            c->ip = next; return true;
+        }
+        case 0x670: {                                   /* emul      */
+            uint64_t t = (uint64_t)a * (uint64_t)b;
+            c->reg[in->srcdst & ~1u]       = (uint32_t)t;
+            c->reg[(in->srcdst & ~1u) + 1] = (uint32_t)(t >> 32);
+            c->ip = next; return true;
+        }
+        case 0x671: {                                   /* ediv      */
+            uint64_t num = ((uint64_t)c->reg[(in->src2 + 1) & 31] << 32) |
+                           c->reg[in->src2 & 31];
+            if (!a) { HALT(c, in, "divide by zero"); }
+            c->reg[in->srcdst & ~1u]       = (uint32_t)(num % a);
+            c->reg[(in->srcdst & ~1u) + 1] = (uint32_t)(num / a);
+            c->ip = next; return true;
+        }
+        case 0x5d8: {                                   /* eshro     */
+            uint64_t t = ((uint64_t)c->reg[(in->src2 + 1) & 31] << 32) |
+                         c->reg[in->src2 & 31];
+            r = (uint32_t)(t >> (a & 31));
+            break;
+        }
+
+        /*
+         * Atomic read-modify-write.  Single-threaded here, so the
+         * atomicity is free; what matters is the data movement.
+         */
+        case 0x610: {                                   /* atmod     */
+            uint32_t ea2 = a & ~3u, old2;
+            if (!rd32m(c, ea2, &old2)) { HALT(c, in, "atmod read"); }
+            if (!wr32m(c, ea2, (c->reg[in->srcdst] & b) | (old2 & ~b))) {
+                HALT(c, in, "atmod write");
+            }
+            r = old2;
+            break;
+        }
+        case 0x612: {                                   /* atadd     */
+            uint32_t ea2 = a & ~3u, old2;
+            if (!rd32m(c, ea2, &old2)) { HALT(c, in, "atadd read"); }
+            if (!wr32m(c, ea2, old2 + b)) { HALT(c, in, "atadd write"); }
+            r = old2;
+            break;
+        }
+        case 0x615: {                                   /* synld     */
+            if (!rd32m(c, a & ~3u, &r)) { HALT(c, in, "synld read"); }
+            set_cc(c, I960_CC_EQUAL);
+            break;
+        }
+
+        case 0x5b4: c->ip = next; return true;          /* intdis   */
+        case 0x5b5: c->ip = next; return true;          /* inten    */
+        case 0x66d: c->ip = next; return true;          /* flushreg */
+        case 0x66f: c->ip = next; return true;          /* syncf    */
+
+        default:
+            /* Conditional add/subtract/select, the Jx family. */
+            if (in->opcode >= 0x780 && in->opcode <= 0x7f4) {
+                unsigned lo = in->opcode & 0xf;
+                unsigned cc = (in->opcode >> 4) & 0x7;
+                bool take = cond_true(c, cc);
+                switch (lo) {
+                case 0x0: r = take ? b + a : c->reg[in->srcdst]; break;
+                case 0x1: r = take ? (uint32_t)((int32_t)b + (int32_t)a)
+                                   : c->reg[in->srcdst]; break;
+                case 0x2: r = take ? b - a : c->reg[in->srcdst]; break;
+                case 0x3: r = take ? (uint32_t)((int32_t)b - (int32_t)a)
+                                   : c->reg[in->srcdst]; break;
+                case 0x4: r = take ? b : a; break;      /* sel<cc>  */
+                default:
+                    HALT(c, in, "unimplemented conditional REG opcode");
+                }
+                break;
+            }
+            HALT(c, in, "unimplemented REG opcode");
+        }
+        c->reg[in->srcdst] = r;
+        c->ip = next;
+        return true;
+
+    default:
+        HALT(c, in, "undecodable word");
+    }
+}
