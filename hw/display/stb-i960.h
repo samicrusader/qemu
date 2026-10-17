@@ -137,7 +137,19 @@ typedef bool (*I960WriteFn)(void *opaque, uint32_t addr, const void *buf, unsign
  */
 typedef bool (*I960SyscallFn)(void *opaque, struct I960Core *c, unsigned index);
 
-#define I960_FRAME_ALIGN 64
+/*
+ * Frames are aligned to SIXTEEN bytes, not to the 64 the register save
+ * area occupies.  PFP's low four bits carry the return type (bits 2:0)
+ * and the prereturn-trace flag (bit 3), which is exactly why sixteen is
+ * the granularity.
+ *
+ * Getting this wrong is subtle and expensive: masking PFP with ~63
+ * truncates any frame that is 16- but not 64-aligned, and both the
+ * firmware's init (FP = 0xa02f6350) and the frames Nucleus PLUS builds
+ * by hand (0xa0351190) are exactly that.  Every such ret then restored
+ * the wrong 64 bytes.
+ */
+#define I960_FRAME_ALIGN 16
 #define I960_NFRAMES     8      /* on-chip local register sets */
 
 typedef struct {
@@ -184,6 +196,18 @@ typedef struct I960Core {
      */
     uint32_t    intbase;
     bool        irq_enabled;
+
+    /*
+     * How often a ret had to read its register set back from memory
+     * instead of popping the cache.  On real hardware that happens only
+     * after the cache overflows; here it is also what a desynchronised
+     * frame chain looks like, so it is counted rather than silent.
+     */
+    uint64_t    mem_restores;
+    uint64_t    tag_mismatches;
+    uint32_t    last_mem_restore_ip, last_mem_restore_fp;
+    uint32_t    last_mem_restore_tag;
+    unsigned    last_mem_restore_depth;
 
     uint64_t    icount;
 } I960Core;

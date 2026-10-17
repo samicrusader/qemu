@@ -634,6 +634,21 @@ static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
     memcpy(s->reg, c->reg, sizeof(s->reg));
 
     /*
+     * Write-through.  The hardware cache is write-back - a set reaches
+     * memory only when it is evicted - but this firmware enters functions
+     * by branch as well as by call, so it rets more often than it calls
+     * and drains the cache below its own bottom.  With write-back, memory
+     * at those frames was never written and the restore read whatever was
+     * lying there.  Writing on every call costs 16 stores and makes the
+     * two paths agree, so a cache miss is merely slower, never wrong.
+     */
+    for (int k = 0; k < 16; k++) {
+        if (!wr32m(c, oldfp + (uint32_t)k * 4, s->reg[k])) {
+            return false;
+        }
+    }
+
+    /*
      * PFP, SP and RIP describe the frame you are IN, so they belong to
      * the NEW register set and must be written after the caller's set has
      * been saved.  Writing RIP first overwrites the caller's own return
@@ -644,7 +659,7 @@ static bool do_call(I960Core *c, uint32_t target, uint32_t retaddr)
     c->reg[I960_RIP] = retaddr;
     c->reg[I960_R0] = oldfp;          /* PFP, return type 000 = local */
     c->reg[I960_FP] = newfp;
-    c->reg[I960_SP] = newfp + I960_FRAME_ALIGN;
+    c->reg[I960_SP] = newfp + 64;      /* past the register save area */
     c->ip = target;
     return true;
 }
@@ -657,25 +672,46 @@ static bool do_ret(I960Core *c)
     unsigned type = pfp & 0x7;
     int i;
 
+    if (pfp == 0) {
+        /*
+         * The bottom of the chain.  On the real board the ROM called into
+         * this firmware and there is a frame beneath it; here there is
+         * not, so say that plainly instead of restoring a zeroed set and
+         * branching to address zero.
+         */
+        c->halt_reason = "returned past the bottom of the frame chain";
+        c->halt_ip = c->ip;
+        c->halt_word = 0;
+        return false;
+    }
+
     if (type == 7) {                                /* interrupt return */
-        I960RegSet *s;
-        if (!c->depth || !c->cache[c->depth - 1].is_irq) {
-            /*
-             * The set that would restore this was spilled, or was not
-             * pushed by an interrupt at all.  Either way the saved IP is
-             * gone and continuing would be invention.
-             */
-            c->halt_reason = "interrupt return with no matching frame";
-            c->halt_ip = c->ip;
-            c->halt_word = pfp;
+        uint32_t saved_pc, saved_ac, saved_ip;
+        uint32_t fp = c->reg[I960_FP];
+
+        if (!rd32m(c, fp - 16, &saved_pc) ||
+            !rd32m(c, fp - 12, &saved_ac) ||
+            !rd32m(c, fp - 8, &saved_ip)) {
             return false;
         }
-        s = &c->cache[--c->depth];
-        memcpy(c->reg, s->reg, sizeof(s->reg));
-        c->ac = s->saved_ac;
-        c->pc = s->saved_pc;
+        /*
+         * No cache entry is required: the kernel hand-builds these frames
+         * to start a task, and such a frame was never pushed by anything.
+         */
+        if (c->depth) {
+            memcpy(c->reg, c->cache[--c->depth].reg,
+                   sizeof(c->cache[0].reg));
+        } else {
+            for (i = 0; i < 16; i++) {
+                if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
+                    return false;
+                }
+            }
+        }
+        c->ac = saved_ac;
+        c->pc = saved_pc;
         c->reg[I960_FP] = newfp;
-        c->ip = s->saved_ip;
+        c->ip = saved_ip;
         return true;
     }
     if (type != 0) {
@@ -691,16 +727,32 @@ static bool do_ret(I960Core *c)
     }
 
     /*
-     * The cache is tagged by frame pointer, and the tag has to be checked.
-     * A plain LIFO pop assumes every ret matches a call, but this firmware
-     * branches between functions - `b 0xa02e4fa8` into the kernel is one -
-     * so a ret can unwind a frame no call ever pushed.  Popping blindly
-     * then hands back some other function's locals, and the damage shows
-     * up as a nonsense PFP much later.
+     * One pop per ret, unconditionally: the cache mirrors call depth, and
+     * that is true even when the firmware branches between functions,
+     * because the ret still unwinds whatever the last call pushed.
+     *
+     * A tag check here was tried and was a mistake.  It skipped the pop
+     * on a mismatch, so depth only ever grew, and the cache drifted out
+     * of step until a ret found it empty and read a register set out of
+     * uninitialised memory.  The mismatches it was reacting to were the
+     * FP alignment bug, not a real divergence.  The tag is kept, because
+     * it is where a spill has to be written, and a mismatch is counted so
+     * genuine drift is still visible.
      */
-    if (c->depth && c->cache[c->depth - 1].fp == newfp) {
-        memcpy(c->reg, c->cache[--c->depth].reg, sizeof(c->cache[0].reg));
+    if (c->depth) {
+        I960RegSet *s = &c->cache[--c->depth];
+        if (s->fp != newfp) {
+            c->tag_mismatches++;
+            c->last_mem_restore_ip = c->ip;
+            c->last_mem_restore_fp = newfp;
+            c->last_mem_restore_tag = s->fp;
+        }
+        memcpy(c->reg, s->reg, sizeof(s->reg));
     } else {
+        c->mem_restores++;
+        c->last_mem_restore_ip = c->ip;
+        c->last_mem_restore_fp = newfp;
+        c->last_mem_restore_depth = c->depth;
         for (i = 0; i < 16; i++) {
             if (!rd32m(c, newfp + (uint32_t)i * 4, &c->reg[i])) {
                 return false;
@@ -747,10 +799,28 @@ I960IrqResult i960_interrupt(I960Core *c, unsigned vector)
     s->fp = oldfp;
     memcpy(s->reg, c->reg, sizeof(s->reg));
 
-    s->is_irq   = true;
-    s->saved_ip = saved_ip;
-    s->saved_ac = c->ac;
-    s->saved_pc = c->pc;
+    s->is_irq = true;
+
+    /*
+     * The interrupt record goes in memory, and its layout is not guessed:
+     * Nucleus PLUS builds one by hand at 0xa02e9488 to start a task, and
+     * that code is the specification -
+     *
+     *   st g3, -0x10(g2)   saved PC    (from modpc)
+     *   st g4, -0x0c(g2)   saved AC    (from modac)
+     *   st g6, -0x08(g2)   saved IP
+     *   or g1, 7, g4 / st g4, (g2)     PFP with return type 111
+     *
+     * An earlier version kept this beside the cached register set on the
+     * grounds that nothing read it.  Nothing reads the one the processor
+     * writes; the kernel writes its own and rets into it, so the record
+     * has to be real memory in the layout the kernel uses.
+     */
+    if (!wr32m(c, newfp - 16, c->pc) ||
+        !wr32m(c, newfp - 12, c->ac) ||
+        !wr32m(c, newfp - 8, saved_ip)) {
+        return I960_IRQ_FAULT;
+    }
 
     c->pc = (c->pc & ~I960_PC_PRIO_MASK) | I960_PC_STATE |
             ((uint32_t)prio << I960_PC_PRIO_SHIFT);
@@ -758,7 +828,7 @@ I960IrqResult i960_interrupt(I960Core *c, unsigned vector)
     c->reg[I960_R0]  = (oldfp & ~(uint32_t)0x7) | 0x7;   /* interrupt ret */
     c->reg[I960_RIP] = saved_ip;      /* what the handler actually reads */
     c->reg[I960_FP]  = newfp;
-    c->reg[I960_SP]  = newfp + I960_FRAME_ALIGN;
+    c->reg[I960_SP]  = newfp + 64;     /* past the register save area */
     c->ip = handler;
     return I960_IRQ_DELIVERED;
 }
@@ -775,6 +845,17 @@ bool i960_step(I960Core *c)
     I960Insn ins;
     I960Insn *in = &ins;
     uint32_t next, ea, a, b, r;
+
+    /*
+     * FP is a 64-byte-aligned quantity by architecture: the processor
+     * ignores g15's low six bits, which is what leaves room for the
+     * return-type field in PFP.  The firmware exploits that - its init
+     * does `lda 0xa02f6350, g1 / mov g1, fp` with a value aligned to 16,
+     * not 64 - so the invariant has to be enforced here rather than
+     * assumed.  Storing the unaligned value verbatim made every ret
+     * compute PFP & ~63 and miss its own frame by 0x10.
+     */
+    c->reg[I960_FP] &= ~(uint32_t)(I960_FRAME_ALIGN - 1);
 
     if (!i960_decode(c, c->ip, in)) {
         c->halt_reason = "instruction fetch failed";
