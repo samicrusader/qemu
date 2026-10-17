@@ -138,6 +138,27 @@ typedef bool (*I960WriteFn)(void *opaque, uint32_t addr, const void *buf, unsign
 typedef bool (*I960SyscallFn)(void *opaque, struct I960Core *c, unsigned index);
 
 /*
+ * Interrupts.
+ *
+ * The table is NOT at address 0 - it is the one the board ROM owns, whose
+ * address the firmware fetches from [[0xa02e8c70] + 0x10], so `intbase`
+ * has to be set from that rather than assumed.  The entry for vector v is
+ * at `intbase + (v + 1) * 4`, equivalently `+ 0x24 + (v - 8) * 4`.
+ *
+ * A Jx dedicated-mode source's vector is `(IMAP field << 4) | 2` - the low
+ * nibble is fixed - and the priority is `vector >> 3`.  Six vectors in this
+ * firmware fit it: 0x72, 0x82, 0xb2, 0xc2, 0xd2 (the timer, from
+ * IMAP2 = 0x000d0000) and 0xe2.  A source's IPND/IMSK bit is a separate
+ * number from its vector: the timer is bit 12 and vector 0xd2.
+ *
+ * Confusing the two is how this model spent a session believing the timer
+ * was vector 12 at priority 1.  The firmware stores its handler both at
+ * [table] + 0x34c and at absolute 0x34, and delivering vector 12 against a
+ * table at 0 reads the latter - so it ran, and was wrong about the vector,
+ * its priority and the table's location all at once.
+ */
+
+/*
  * Frames are aligned to SIXTEEN bytes, not to the 64 the register save
  * area occupies.  PFP's low four bits carry the return type (bits 2:0)
  * and the prereturn-trace flag (bit 3), which is exactly why sixteen is
