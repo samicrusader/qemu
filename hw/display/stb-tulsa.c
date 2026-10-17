@@ -1116,7 +1116,7 @@ static void stb_prof_end(STBTulsaV2200 *s, unsigned bucket, int64_t t0)
 static void stb_prof_report(STBTulsaV2200 *s)
 {
     static const char *const names[STB_PROF_MAX] = {
-        "list", "field", "composite", "reg"
+        "submit", "list", "field", "composite", "reg"
     };
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     uint64_t window;
@@ -1892,11 +1892,11 @@ static void stb_v2200_run_list(STBTulsaV2200 *s, uint32_t addr, bool replay)
     }
     s->lists_submitted++;
     /*
-     * With no microcode running, retire the list immediately: the host polls
-     * both pointers to pick a buffer that is neither current nor active, and
-     * would otherwise run out after three submissions.
+     * Retiring is stb_v2200_run_one's job now, after the work rather than
+     * before it - which is the order the board uses (section 21).  The
+     * host polls both pointers to pick a buffer that is neither current
+     * nor active, so it must still happen, just not here.
      */
-    s->cmd_active = addr;
 }
 
 
@@ -2029,12 +2029,13 @@ static void stb_v2200_lle_list(STBTulsaV2200 *s, uint32_t addr)
                       s->role ?: "?", s->core.halt_pc,
                       s->core.halt_reason ?: "?");
         s->lle_running = false;
+    s->pend_head = s->pend_tail = 0;
     memset(s->prof, 0, sizeof(s->prof));
     s->prof_window = 0;
     }
 }
 
-static void stb_v2200_decode_list(STBTulsaV2200 *s, uint32_t addr)
+static void stb_v2200_run_one(STBTulsaV2200 *s, uint32_t addr)
 {
     int64_t t0 = stb_prof_begin();
 
@@ -2043,12 +2044,52 @@ static void stb_v2200_decode_list(STBTulsaV2200 *s, uint32_t addr)
     } else {
         stb_v2200_run_list(s, addr, false);
     }
-    /*
-     * This ran inside the vCPU thread, holding the BQL, with the guest
-     * stopped on the store to the cmdptr aperture that got us here.  So
-     * this bucket is not "work the card did" - it is guest stall.
-     */
     stb_prof_end(s, STB_PROF_LIST, t0);
+    /*
+     * Retire only now.  Section 21: the board executes the list and then
+     * stores its address to 0x6CFC, and the driver chooses its next
+     * buffer by polling for one that is neither current nor active.
+     * Retiring at submission time - which is what a synchronous model
+     * has to do - tells the guest the work is finished before it is.
+     */
+    s->cmd_active = addr;
+}
+
+/*
+ * Lists run out of line, in a bottom half.  The point is not that the
+ * work gets cheaper - it is the same work - but that it stops happening
+ * inside the vCPU thread with the guest frozen on the store that
+ * submitted it.  Section 147.4 measured a single list at 42.7ms, two and
+ * a half fields of dead guest; here the store returns at once and the
+ * guest keeps executing while the main loop catches up.
+ */
+static void stb_v2200_list_bh(void *opaque)
+{
+    STBTulsaV2200 *s = opaque;
+
+    while (s->pend_tail != s->pend_head) {
+        uint32_t addr = s->pending[s->pend_tail % STB_V2200_PENDING];
+
+        s->pend_tail++;
+        stb_v2200_run_one(s, addr);
+    }
+}
+
+static void stb_v2200_decode_list(STBTulsaV2200 *s, uint32_t addr)
+{
+    if (s->pend_head - s->pend_tail >= STB_V2200_PENDING) {
+        /*
+         * The queue is as deep as the driver has buffers, so this means
+         * the host is submitting faster than the model can draw.  Run it
+         * inline rather than drop it: a lost list is a frame that never
+         * updates, which is far harder to recognise than a stall.
+         */
+        stb_v2200_run_one(s, addr);
+        return;
+    }
+    s->pending[s->pend_head % STB_V2200_PENDING] = addr;
+    s->pend_head++;
+    qemu_bh_schedule(s->list_bh);
 }
 
 /*
@@ -2263,8 +2304,16 @@ static void stb_v2200_cmdptr_write(void *opaque, hwaddr addr, uint64_t val,
     STBTulsaV2200 *s = opaque;
 
     if (addr == 0) {
+        int64_t t0 = stb_prof_begin();
+
         s->cmd_current = val;
         stb_v2200_decode_list(s, val);
+        /*
+         * What the guest actually waits for.  With the list queued this
+         * should be a handful of nanoseconds; if it is not, the queue
+         * overflowed and a list ran inline.
+         */
+        stb_prof_end(s, STB_PROF_SUBMIT, t0);
     } else {
         s->cmd_active = val;
     }
@@ -2694,6 +2743,8 @@ static void stb_v2200_realize(PCIDevice *pdev, Error **errp)
         qemu_console_resize(s->con, STB_V2200_DISP_W, STB_V2200_DISP_H);
     }
 
+    s->list_bh = qemu_bh_new_guarded(stb_v2200_list_bh, s,
+                                     &DEVICE(s)->mem_reentrancy_guard);
     s->field_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stb_v2200_scroll_tick, s);
     s->field_deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod(s->field_timer, stb_field_next(&s->field_deadline));
@@ -2704,17 +2755,34 @@ static void stb_v2200_realize(PCIDevice *pdev, Error **errp)
      *   qom-get path=/machine/peripheral/tulsa-rgb property=prof-list-ns
      */
     {
+        /*
+         * Keyed by the enum, not by position: section 148 added
+         * STB_PROF_SUBMIT at the front of STBTulsaProfKind and these two
+         * arrays kept their old order, which left pname[STB_PROF_MAX-1]
+         * NULL and took object_property_add_uint64_ptr() into strlen(NULL)
+         * before the machine ever finished building.  Designated
+         * initialisers cannot drift like that, and the assert below turns
+         * a forgotten name into a diagnosable abort rather than a
+         * segfault in QOM.
+         */
         static const char *const pname[STB_PROF_MAX] = {
-            "prof-list-ns", "prof-field-ns", "prof-composite-ns",
-            "prof-reg-ns"
+            [STB_PROF_SUBMIT]    = "prof-submit-ns",
+            [STB_PROF_LIST]      = "prof-list-ns",
+            [STB_PROF_FIELD]     = "prof-field-ns",
+            [STB_PROF_COMPOSITE] = "prof-composite-ns",
+            [STB_PROF_REG]       = "prof-reg-ns",
         };
         static const char *const cname[STB_PROF_MAX] = {
-            "prof-list-calls", "prof-field-calls", "prof-composite-calls",
-            "prof-reg-calls"
+            [STB_PROF_SUBMIT]    = "prof-submit-calls",
+            [STB_PROF_LIST]      = "prof-list-calls",
+            [STB_PROF_FIELD]     = "prof-field-calls",
+            [STB_PROF_COMPOSITE] = "prof-composite-calls",
+            [STB_PROF_REG]       = "prof-reg-calls",
         };
         unsigned i;
 
         for (i = 0; i < STB_PROF_MAX; i++) {
+            assert(pname[i] && cname[i]);
             object_property_add_uint64_ptr(OBJECT(s), pname[i],
                                            &s->prof[i].ns_total,
                                            OBJ_PROP_FLAG_READ);

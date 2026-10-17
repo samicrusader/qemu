@@ -473,6 +473,7 @@ typedef struct QEMU_PACKED {
  * worth of real work is a few thousand; the ceiling is only here so a
  * microcode that spins cannot wedge the whole VM.
  */
+#define STB_V2200_PENDING     8
 #define STB_V2200_UCODE_ENTRY 0x1800
 #define STB_V2200_LLE_BUDGET  (4u * 1000 * 1000)
 #define STB_V2200_CMD_ACTIVE  0x6cfc  /* microcode publishes what it retired */
@@ -640,7 +641,8 @@ struct STBTulsaATU {
  * -icount those are deliberately unrelated.
  */
 enum {
-    STB_PROF_LIST,      /* a display list, in the vCPU thread  */
+    STB_PROF_SUBMIT,    /* the MMIO write itself: pure guest stall */
+    STB_PROF_LIST,      /* a display list, now off the vCPU thread */
     STB_PROF_FIELD,     /* the field timer, in the main loop   */
     STB_PROF_COMPOSITE, /* the mixer and console upload        */
     STB_PROF_REG,       /* every other MMIO access             */
@@ -732,6 +734,18 @@ struct STBTulsaV2200 {
      */
     STBTulsaProf prof[STB_PROF_MAX];
     int64_t      prof_window;      /* start of the current report window  */
+
+    /*
+     * Submitted lists waiting to run.  The board executes a list on its
+     * own RISC and only then stores its address to the retire pointer at
+     * 0x6CFC (section 21), and the driver picks its next buffer by
+     * polling for one that is neither current nor active - so running
+     * the list out of line and retiring it afterwards is what the
+     * hardware does, not a liberty taken for speed.  Section 148.
+     */
+    uint32_t     pending[STB_V2200_PENDING];
+    unsigned     pend_head, pend_tail;
+    QEMUBH      *list_bh;
     V2200Core    core;
     V2200Pix     pix;
 
