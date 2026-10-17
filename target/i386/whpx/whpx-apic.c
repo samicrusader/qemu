@@ -262,7 +262,16 @@ static void whpx_send_msi(MSIMessage *msg)
     uint8_t delivery = (data >> MSI_DATA_DELIVERY_MODE_SHIFT) & 0x7;
 
     if (vector == 0) {
-        warn_report("Ignoring request for interrupt vector 0");
+        /*
+         * Under WHPX every write to the local APIC MMIO page arrives here as
+         * an MSI, so a register write whose low byte happens to be zero asks
+         * for vector 0 - which is reserved and undeliverable either way.
+         * Print what it was: the bare warning says nothing about the writer.
+         */
+        warn_report("Ignoring request for interrupt vector 0 "
+                    "(apic mmio addr 0x%" PRIx64 ", data 0x%08x, "
+                    "dest %u, dest_mode %u, trigger %u, delivery %u)",
+                    addr, data, dest, dest_mode, trigger_mode, delivery);
         return;
     }
 
