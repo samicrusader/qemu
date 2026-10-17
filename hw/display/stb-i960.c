@@ -450,7 +450,8 @@ int i960_format(const I960Insn *in, char *buf, size_t buflen)
             break;
         }
 
-        if (in->opcode == 0x84) {                     /* bx: no srcdst */
+        /* bx and callx branch to the effective address; no register. */
+        if (in->opcode == 0x84 || in->opcode == 0x86) {
             return snprintf(buf, buflen, "%-8s %s", m, ea);
         }
         if (store) {
