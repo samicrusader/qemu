@@ -460,3 +460,15 @@ launch_update_write(void) ""
 vmlaunch_reset_enter(void) ""
 vm_launchupdate_finalize(void) ""
 restore_host_x86_igvm(void) ""
+
+# sealevel-3096.c
+sealevel_3096_read(uint64_t addr, uint8_t val) "base+%" PRIu64 " -> 0x%02x"
+sealevel_3096_write(uint64_t addr, uint64_t val) "base+%" PRIu64 " <- 0x%02" PRIx64
+sealevel_3096_relays(uint8_t old, uint64_t val) "relays 0x%02x -> 0x%02" PRIx64
+sealevel_3096_inputs(uint8_t old, uint8_t val) "inputs 0x%02x -> 0x%02x"
+
+# sealevel-8001.c
+sealevel_8001_read(uint64_t addr, uint8_t val) "base+%" PRIu64 " -> 0x%02x"
+sealevel_8001_write(uint64_t addr, uint64_t val) "base+%" PRIu64 " <- 0x%02" PRIx64
+sealevel_8001_outputs(uint8_t dir, uint32_t old, uint32_t val) "dir 0x%x outputs 0x%08x -> 0x%08x"
+sealevel_8001_inputs(uint32_t old, uint32_t val) "inputs 0x%08x -> 0x%08x"
