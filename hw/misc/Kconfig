@@ -265,12 +265,17 @@ config K230_DECOMP_GZIP
 
 source macio/Kconfig
 
+config SEALEVEL_CHAN
+    bool
+
 config SEALEVEL_3096
     bool
     default y if ISA_BUS
     depends on ISA_BUS
+    select SEALEVEL_CHAN
 
 config SEALEVEL_8001
     bool
     default y if PCI_DEVICES
     depends on PCI
+    select SEALEVEL_CHAN

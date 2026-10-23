@@ -178,5 +178,6 @@ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
 system_ss.add(when: 'CONFIG_AXIADO_CLK', if_true: files('axiado_clk.c'))
 
+system_ss.add(when: 'CONFIG_SEALEVEL_CHAN', if_true: files('sealevel-chan.c'))
 system_ss.add(when: 'CONFIG_SEALEVEL_3096', if_true: files('sealevel-3096.c'))
 system_ss.add(when: 'CONFIG_SEALEVEL_8001', if_true: files('sealevel-8001.c'))

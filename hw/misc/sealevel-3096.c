@@ -21,6 +21,10 @@
  *   inputs   u8 RW  opto inputs, 1 = voltage applied (opto lit)
  *   relays   u8 RO  relay contacts, 1 = closed
  *
+ * or through chardevs (see include/hw/misc/sealevel-chan.h), same polarity:
+ *   chardev-a / invert-a   opto inputs in
+ *   chardev-c / invert-c   relay contacts out
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -32,6 +36,8 @@
 #include "hw/isa/isa.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
+#include "hw/misc/sealevel-chan.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
 #include "trace.h"
@@ -57,6 +63,9 @@ struct Sealevel3096State {
     /* state */
     uint8_t inputs;             /* 1 = opto lit */
     uint8_t relays;             /* 1 = relay closed */
+
+    SeaIOChan chan_a;
+    SeaIOChan chan_c;
 };
 
 static void sl3096_update_irq(Sealevel3096State *s)
@@ -102,6 +111,7 @@ static void sl3096_write(void *opaque, hwaddr addr, uint64_t val,
     if (s->relays != (uint8_t)val) {
         trace_sealevel_3096_relays(s->relays, val);
         s->relays = val;
+        sealevel_chan_update(&s->chan_c);
     }
 }
 
@@ -113,6 +123,41 @@ static const MemoryRegionOps sl3096_ops = {
     .impl.min_access_size = 1,
     .impl.max_access_size = 1,
     .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void sl3096_apply_inputs(Sealevel3096State *s, uint8_t val)
+{
+    trace_sealevel_3096_inputs(s->inputs, val);
+    s->inputs = val;
+    sl3096_update_irq(s);
+}
+
+static int sl3096_chan_get_output(void *opaque, unsigned port)
+{
+    Sealevel3096State *s = opaque;
+    return port == SL3096_PORT_C ? s->relays : -1;
+}
+
+static uint8_t sl3096_chan_get_input(void *opaque, unsigned port)
+{
+    Sealevel3096State *s = opaque;
+    return port == SL3096_PORT_A ? s->inputs : 0;
+}
+
+static void sl3096_chan_set_input(void *opaque, unsigned port, uint8_t val)
+{
+    sl3096_apply_inputs(opaque, val);
+}
+
+static const SeaIOChanOps sl3096_chan_a_ops = {
+    .get_output = sl3096_chan_get_output,
+    .get_input = sl3096_chan_get_input,
+    .set_input = sl3096_chan_set_input,
+};
+
+static const SeaIOChanOps sl3096_chan_c_ops = {
+    .get_output = sl3096_chan_get_output,
+    .get_input = sl3096_chan_get_input,
 };
 
 static void sl3096_get_inputs(Object *obj, Visitor *v, const char *name,
@@ -131,9 +176,7 @@ static void sl3096_set_inputs(Object *obj, Visitor *v, const char *name,
     if (!visit_type_uint8(v, name, &val, errp)) {
         return;
     }
-    trace_sealevel_3096_inputs(s->inputs, val);
-    s->inputs = val;
-    sl3096_update_irq(s);
+    sl3096_apply_inputs(s, val);
 }
 
 static void sl3096_get_relays(Object *obj, Visitor *v, const char *name,
@@ -166,6 +209,11 @@ static void sl3096_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->io, OBJECT(dev), &sl3096_ops, s,
                           TYPE_SEALEVEL_3096, SL3096_IOSIZE);
     isa_register_ioport(isa, &s->io, s->iobase);
+
+    sealevel_chan_realize(&s->chan_a, &sl3096_chan_a_ops, s,
+                          SL3096_PORT_A, "3096.A");
+    sealevel_chan_realize(&s->chan_c, &sl3096_chan_c_ops, s,
+                          SL3096_PORT_C, "3096.C");
 }
 
 static void sl3096_reset(DeviceState *dev)
@@ -175,6 +223,7 @@ static void sl3096_reset(DeviceState *dev)
     /* Relays drop out; the inputs are external and survive a reset. */
     s->relays = 0;
     sl3096_update_irq(s);
+    sealevel_chan_update(&s->chan_c);
 }
 
 static void sl3096_instance_init(Object *obj)
@@ -205,6 +254,10 @@ static const Property sl3096_properties[] = {
     DEFINE_PROP_UINT32("irq", Sealevel3096State, isairq, 0),
     DEFINE_PROP_BOOL("readback-inverted", Sealevel3096State,
                      readback_inverted, true),
+    DEFINE_PROP_CHR("chardev-a", Sealevel3096State, chan_a.chr),
+    DEFINE_PROP_BOOL("invert-a", Sealevel3096State, chan_a.invert, false),
+    DEFINE_PROP_CHR("chardev-c", Sealevel3096State, chan_c.chr),
+    DEFINE_PROP_BOOL("invert-c", Sealevel3096State, chan_c.invert, false),
 };
 
 static void sl3096_class_init(ObjectClass *klass, const void *data)

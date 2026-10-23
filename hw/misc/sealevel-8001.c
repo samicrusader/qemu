@@ -21,6 +21,10 @@
  *   outputs    u32 RO  levels driven by the card, output ports only
  *   direction  u8  RO  DIRA-DIRD
  *
+ * or through chardevs (see include/hw/misc/sealevel-chan.h), one per port:
+ *   chardev-a..d / invert-a..d   reports the port while it is an output,
+ *                                accepts its input lines while an input
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -30,6 +34,9 @@
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
+#include "hw/misc/sealevel-chan.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
 #include "trace.h"
@@ -59,6 +66,8 @@ struct Sealevel8001State {
     uint32_t inputs;            /* external lines, A in bits 0-7 */
     uint8_t dir;
     uint8_t irqctl;
+
+    SeaIOChan chan[SL8001_NPORTS];
 };
 
 static uint32_t sl8001_outputs(Sealevel8001State *s)
@@ -132,6 +141,9 @@ static void sl8001_write(void *opaque, hwaddr addr, uint64_t val,
     if (after != before) {
         trace_sealevel_8001_outputs(s->dir, before, after);
     }
+    for (int i = 0; i < SL8001_NPORTS; i++) {
+        sealevel_chan_update(&s->chan[i]);
+    }
 }
 
 static const MemoryRegionOps sl8001_ops = {
@@ -142,6 +154,33 @@ static const MemoryRegionOps sl8001_ops = {
     .impl.min_access_size = 1,
     .impl.max_access_size = 1,
     .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static int sl8001_chan_get_output(void *opaque, unsigned port)
+{
+    Sealevel8001State *s = opaque;
+    return (s->dir & BIT(port)) ? s->latch[port] : -1;
+}
+
+static uint8_t sl8001_chan_get_input(void *opaque, unsigned port)
+{
+    Sealevel8001State *s = opaque;
+    return extract32(s->inputs, 8 * port, 8);
+}
+
+static void sl8001_chan_set_input(void *opaque, unsigned port, uint8_t val)
+{
+    Sealevel8001State *s = opaque;
+    uint32_t inputs = deposit32(s->inputs, 8 * port, 8, val);
+
+    trace_sealevel_8001_inputs(s->inputs, inputs);
+    s->inputs = inputs;
+}
+
+static const SeaIOChanOps sl8001_chan_ops = {
+    .get_output = sl8001_chan_get_output,
+    .get_input = sl8001_chan_get_input,
+    .set_input = sl8001_chan_set_input,
 };
 
 static void sl8001_get_inputs(Object *obj, Visitor *v, const char *name,
@@ -186,6 +225,13 @@ static void sl8001_realize(PCIDevice *pdev, Error **errp)
     memory_region_init_io(&s->io, OBJECT(s), &sl8001_ops, s,
                           TYPE_SEALEVEL_8001, SL8001_IOSIZE);
     pci_register_bar(pdev, SL8001_BAR, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
+
+    for (int i = 0; i < SL8001_NPORTS; i++) {
+        static const char *const names[] = {
+            "8001.A", "8001.B", "8001.C", "8001.D",
+        };
+        sealevel_chan_realize(&s->chan[i], &sl8001_chan_ops, s, i, names[i]);
+    }
 }
 
 static void sl8001_reset(DeviceState *dev)
@@ -196,6 +242,9 @@ static void sl8001_reset(DeviceState *dev)
     memset(s->latch, 0, sizeof(s->latch));
     s->dir = 0;
     s->irqctl = 0;
+    for (int i = 0; i < SL8001_NPORTS; i++) {
+        sealevel_chan_update(&s->chan[i]);
+    }
 }
 
 static void sl8001_instance_init(Object *obj)
@@ -228,6 +277,17 @@ static const VMStateDescription vmstate_sl8001 = {
     },
 };
 
+static const Property sl8001_properties[] = {
+    DEFINE_PROP_CHR("chardev-a", Sealevel8001State, chan[0].chr),
+    DEFINE_PROP_BOOL("invert-a", Sealevel8001State, chan[0].invert, false),
+    DEFINE_PROP_CHR("chardev-b", Sealevel8001State, chan[1].chr),
+    DEFINE_PROP_BOOL("invert-b", Sealevel8001State, chan[1].invert, false),
+    DEFINE_PROP_CHR("chardev-c", Sealevel8001State, chan[2].chr),
+    DEFINE_PROP_BOOL("invert-c", Sealevel8001State, chan[2].invert, false),
+    DEFINE_PROP_CHR("chardev-d", Sealevel8001State, chan[3].chr),
+    DEFINE_PROP_BOOL("invert-d", Sealevel8001State, chan[3].invert, false),
+};
+
 static void sl8001_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -240,6 +300,7 @@ static void sl8001_class_init(ObjectClass *klass, const void *data)
     dc->desc = "Sealevel 8001 PIO-32.PCI (32 TTL digital I/O lines)";
     dc->vmsd = &vmstate_sl8001;
     device_class_set_legacy_reset(dc, sl8001_reset);
+    device_class_set_props(dc, sl8001_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 

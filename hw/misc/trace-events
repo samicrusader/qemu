@@ -461,6 +461,11 @@ vmlaunch_reset_enter(void) ""
 vm_launchupdate_finalize(void) ""
 restore_host_x86_igvm(void) ""
 
+# sealevel-chan.c
+sealevel_chan_connect(const char *name) "%s connected"
+sealevel_chan_tx(const char *name, uint8_t val) "%s -> 0x%02x"
+sealevel_chan_rx(const char *name, uint8_t val) "%s <- 0x%02x"
+
 # sealevel-3096.c
 sealevel_3096_read(uint64_t addr, uint8_t val) "base+%" PRIu64 " -> 0x%02x"
 sealevel_3096_write(uint64_t addr, uint64_t val) "base+%" PRIu64 " <- 0x%02" PRIx64
