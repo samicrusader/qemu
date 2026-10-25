@@ -23,6 +23,7 @@
 #include "intel-hda.h"
 #include "migration/vmstate.h"
 #include "qemu/host-utils.h"
+#include "qapi/error.h"
 #include "qemu/module.h"
 #include "intel-hda-defs.h"
 #include "qemu/audio.h"
@@ -47,11 +48,36 @@ typedef struct desc_node {
     uint32_t stindex;
 } desc_node;
 
+/* converter with no QEMU audio voice behind it (e.g. S/PDIF) */
+#define HDA_NO_STREAM  0xff
+/* highest node id + 1 and max input amps per node, stateful codecs only */
+#define HDA_MAX_NID    0x80
+#define HDA_MAX_CONN   16
+
+/* power-on register values for one node of a stateful codec */
+typedef struct HDANodeInit {
+    uint32_t nid;
+    uint32_t conn_sel;
+    uint8_t amp_out[2];
+    uint8_t amp_in[HDA_MAX_CONN][2];
+} HDANodeInit;
+
 typedef struct desc_codec {
     const char *name;
     uint32_t iid;
     const desc_node *nodes;
     uint32_t nnodes;
+    /*
+     * Stateful codecs model every widget register (amps on any node,
+     * connection selects, pin controls, power, EAPD, GPIO, digital
+     * converters) instead of folding everything onto the converter
+     * streams, and may run several output converters off one DMA stream
+     * (multichannel playback).  Needed for codecs whose Linux driver is
+     * a vendor patch rather than the generic parser.
+     */
+    bool stateful;
+    const HDANodeInit *init;
+    uint32_t ninit;
 } desc_codec;
 
 static const desc_param* hda_codec_find_param(const desc_node *node, uint32_t id)
@@ -131,6 +157,8 @@ static void hda_codec_parse_fmt(uint32_t format, struct audsettings *as)
 #define   PARAM nomixemu
 #include  "hda-codec-common.h"
 
+#include "hda-codec-ad1989a.h"
+
 #define HDA_TIMER_TICKS (SCALE_MS)
 #define B_SIZE sizeof(st->buf)
 #define B_MASK (sizeof(st->buf) - 1)
@@ -160,6 +188,9 @@ struct HDAAudioStream {
     uint32_t format;
     uint32_t gain_left, gain_right;
     bool mute_left, mute_right;
+    uint32_t amp_steps;     /* gain value that means 0 dB / full scale */
+    uint32_t dma_channels;  /* channels per frame on the DMA stream */
+    int64_t dma_pos;        /* bytes pulled from DMA by a group leader */
     struct audsettings as;
     union {
         SWVoiceIn *in;
@@ -174,15 +205,48 @@ struct HDAAudioStream {
     int64_t buft_start;
 };
 
+#define HDA_AUDIO_MAX_STREAMS 8
+
+typedef struct HDANodeState {
+    uint8_t amp_out[2];
+    uint8_t amp_in[HDA_MAX_CONN][2];
+    uint8_t conn_sel;
+    uint8_t pinctl;
+    uint8_t power;
+    uint8_t eapd;
+    uint8_t unsol;
+    uint8_t sdi;
+    uint8_t beep;
+    uint8_t conv;       /* stream/channel of converters without a voice */
+    uint16_t format;    /* stream format of converters without a voice */
+    uint16_t digi;      /* S/PDIF converter control 1 (low) / 2 (high) */
+    uint16_t coef_index;
+    uint32_t config;    /* pin default config, guest may override */
+} HDANodeState;
+
+enum {
+    HDA_GPIO_DATA,
+    HDA_GPIO_MASK,
+    HDA_GPIO_DIRECTION,
+    HDA_GPIO_WAKE_MASK,
+    HDA_GPIO_UNSOL_MASK,
+    HDA_GPIO_STICKY_MASK,
+    HDA_GPIO_NREGS
+};
+
 struct HDAAudioState {
     HDACodecDevice hda;
     const char *name;
 
     AudioBackend *audio_be;
     const desc_codec *desc;
-    HDAAudioStream st[4];
+    HDAAudioStream st[HDA_AUDIO_MAX_STREAMS];
     bool running_compat[16];
     bool running_real[2 * 16];
+
+    /* stateful codecs only */
+    HDANodeState nodes[HDA_MAX_NID];
+    uint8_t gpio[HDA_GPIO_NREGS];
 
     /* properties */
     uint32_t debug;
@@ -287,11 +351,83 @@ static void hda_audio_input_cb(void *opaque, int avail)
     hda_timer_sync_adjust(st, -((wpos - rpos) - (B_SIZE >> 1)));
 }
 
+/*
+ * Stateful codecs: every output converter on a stream tag sees the whole
+ * interleaved frame (the guest programs the full channel count into each
+ * converter's format and a channel offset into its stream id).  Only the
+ * converter at channel 0 pulls from DMA; it then copies each member's
+ * channel pair into that member's ring, so every converter keeps a plain
+ * stereo/mono voice and the DMA position advances exactly once.
+ */
+static void hda_audio_output_timer_group(HDAAudioStream *st, int64_t now)
+{
+    HDAAudioState *a = st->state;
+    HDAAudioStream *grp[HDA_AUDIO_MAX_STREAMS];
+    uint8_t tmp[4096];
+    uint32_t frame = 2 * st->dma_channels;
+    int64_t uptime = now - st->buft_start;
+    int64_t wanted, frames;
+    int i, ng = 0;
+
+    for (i = 0; i < ARRAY_SIZE(a->st); i++) {
+        HDAAudioStream *m = &a->st[i];
+        if (m->node && m->output && m->running && m->stream == st->stream &&
+            m->dma_channels == st->dma_channels &&
+            m->channel < st->dma_channels) {
+            grp[ng++] = m;
+        }
+    }
+
+    if (uptime <= 0 || frame == 0) {
+        return;
+    }
+    wanted = muldiv64(uptime, frame * st->as.freq, NANOSECONDS_PER_SECOND);
+    wanted -= wanted % frame;
+    if (wanted <= st->dma_pos) {
+        return;
+    }
+
+    frames = (wanted - st->dma_pos) / frame;
+    for (i = 0; i < ng; i++) {
+        uint32_t unit = 2 * grp[i]->as.nchannels;
+        frames = MIN(frames, (B_SIZE - (grp[i]->wpos - grp[i]->rpos)) / unit);
+    }
+
+    while (frames > 0) {
+        int64_t n = MIN(frames, sizeof(tmp) / frame);
+        int64_t f;
+
+        if (!hda_codec_xfer(&a->hda, st->stream, true, tmp, n * frame)) {
+            break;
+        }
+        for (i = 0; i < ng; i++) {
+            HDAAudioStream *m = grp[i];
+            uint32_t unit = 2 * m->as.nchannels;
+            for (f = 0; f < n; f++) {
+                memcpy(m->buf + (m->wpos & B_MASK),
+                       tmp + f * frame + 2 * m->channel, unit);
+                m->wpos += unit;
+            }
+        }
+        st->dma_pos += n * frame;
+        frames -= n;
+    }
+}
+
 static void hda_audio_output_timer(void *opaque)
 {
     HDAAudioStream *st = opaque;
 
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (st->state->desc->stateful) {
+        if (st->channel != 0) {
+            /* a group member: the channel 0 converter feeds our ring */
+            return;
+        }
+        hda_audio_output_timer_group(st, now);
+        goto out_timer;
+    }
 
     int64_t uptime = now - st->buft_start;
     int64_t wpos = st->wpos;
@@ -381,6 +517,7 @@ static void hda_audio_set_running(HDAAudioStream *st, bool running)
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         st->rpos = 0;
         st->wpos = 0;
+        st->dma_pos = 0;
         st->buft_start = now;
         timer_mod_anticipate_ns(st->buft, now + HDA_TIMER_TICKS);
     } else {
@@ -406,8 +543,8 @@ static void hda_audio_set_amp(HDAAudioStream *st)
     left  = st->mute_left  ? 0 : st->gain_left;
     right = st->mute_right ? 0 : st->gain_right;
 
-    left = left * 255 / QEMU_HDA_AMP_STEPS;
-    right = right * 255 / QEMU_HDA_AMP_STEPS;
+    left = MIN(255, left * 255 / st->amp_steps);
+    right = MIN(255, right * 255 / st->amp_steps);
 
     if (!st->state->mixer) {
         return;
@@ -445,6 +582,310 @@ static void hda_audio_setup(HDAAudioStream *st)
     }
 }
 
+/* -------------------------------------------------------------------------- */
+/* stateful codecs                                                            */
+
+static HDAAudioStream *hda_node_stream(HDAAudioState *a, const desc_node *node)
+{
+    HDAAudioStream *st;
+
+    if (node->stindex == HDA_NO_STREAM) {
+        return NULL;
+    }
+    st = a->st + node->stindex;
+    return st->node ? st : NULL;
+}
+
+/*
+ * Voice settings follow the converter's slice of the DMA frame: the guest
+ * programs the full channel count into every converter of a multichannel
+ * stream, plus a channel offset; the converter itself carries two of them.
+ */
+static void hda_audio_stateful_setup(HDAAudioStream *st)
+{
+    struct audsettings as = st->as;
+    uint32_t total;
+
+    hda_codec_parse_fmt(st->format, &as);
+    total = as.nchannels;
+    st->dma_channels = total;
+    if (st->channel < total) {
+        as.nchannels = MIN(2, total - st->channel);
+    } else {
+        as.nchannels = 2;
+    }
+    st->as = as;
+    hda_audio_setup(st);
+}
+
+static uint32_t hda_amp_zero_db(const desc_codec *desc, const desc_node *node)
+{
+    const desc_param *param = hda_codec_find_param(node, AC_PAR_AMP_OUT_CAP);
+    uint32_t caps = param ? param->val : 0;
+    uint32_t ofs = (caps & AC_AMPCAP_OFFSET) >> AC_AMPCAP_OFFSET_SHIFT;
+    uint32_t steps = (caps & AC_AMPCAP_NUM_STEPS) >> AC_AMPCAP_NUM_STEPS_SHIFT;
+
+    return ofs ? ofs : (steps ? steps : QEMU_HDA_AMP_STEPS);
+}
+
+/*
+ * The host voice volume of a DAC is its own output amp; the volume of an
+ * ADC is the output amp of the selector feeding it (where the capture
+ * volume lives on codecs such as the AD198x).
+ */
+static void hda_audio_stateful_sync_amps(HDAAudioState *a)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(a->st); i++) {
+        HDAAudioStream *st = &a->st[i];
+        const desc_node *src;
+        const uint8_t *g;
+
+        if (st->node == NULL) {
+            continue;
+        }
+        src = st->node;
+        if (!st->output && src->conn) {
+            src = hda_codec_find_node(a->desc, src->conn[0]) ?: src;
+        }
+        g = a->nodes[src->nid].amp_out;
+        st->amp_steps = hda_amp_zero_db(a->desc, src);
+        st->gain_left = g[0] & AC_AMP_GAIN;
+        st->mute_left = g[0] & AC_AMP_MUTE;
+        st->gain_right = g[1] & AC_AMP_GAIN;
+        st->mute_right = g[1] & AC_AMP_MUTE;
+        hda_audio_set_amp(st);
+    }
+}
+
+static void hda_audio_stateful_reset(HDAAudioState *a)
+{
+    const desc_codec *desc = a->desc;
+    uint32_t i, j;
+
+    memset(a->nodes, 0, sizeof(a->nodes));
+    memset(a->gpio, 0, sizeof(a->gpio));
+    for (i = 0; i < desc->nnodes; i++) {
+        const desc_node *node = desc->nodes + i;
+        a->nodes[node->nid].config = node->config;
+        a->nodes[node->nid].pinctl = node->pinctl;
+    }
+    for (i = 0; i < desc->ninit; i++) {
+        const HDANodeInit *ini = desc->init + i;
+        HDANodeState *ns = &a->nodes[ini->nid];
+        ns->conn_sel = ini->conn_sel;
+        ns->amp_out[0] = ini->amp_out[0];
+        ns->amp_out[1] = ini->amp_out[1];
+        for (j = 0; j < HDA_MAX_CONN; j++) {
+            ns->amp_in[j][0] = ini->amp_in[j][0];
+            ns->amp_in[j][1] = ini->amp_in[j][1];
+        }
+    }
+    for (i = 0; i < ARRAY_SIZE(a->st); i++) {
+        HDAAudioStream *st = &a->st[i];
+        if (st->node == NULL) {
+            continue;
+        }
+        hda_audio_set_running(st, false);
+        st->stream = 0;
+        st->channel = 0;
+        st->format = AC_FMT_TYPE_PCM | AC_FMT_BITS_16 |
+            (1 << AC_FMT_CHAN_SHIFT);
+        hda_audio_stateful_setup(st);
+    }
+    hda_audio_stateful_sync_amps(a);
+}
+
+static void hda_audio_command_stateful(HDAAudioState *a, const desc_node *node,
+                                       uint32_t verb, uint32_t payload)
+{
+    HDANodeState *ns = &a->nodes[node->nid];
+    HDAAudioStream *st = hda_node_stream(a, node);
+    const desc_param *param;
+    uint32_t response = 0, count, shift, idx, lr;
+
+    switch (verb) {
+    case AC_VERB_PARAMETERS:
+        param = hda_codec_find_param(node, payload);
+        response = param ? param->val : 0;
+        break;
+    case AC_VERB_GET_SUBSYSTEM_ID:
+        response = a->desc->iid;
+        break;
+
+    /* connections */
+    case AC_VERB_GET_CONNECT_LIST:
+        param = hda_codec_find_param(node, AC_PAR_CONNLIST_LEN);
+        count = param ? param->val : 0;
+        shift = 0;
+        while (payload < count && shift < 32) {
+            response |= node->conn[payload] << shift;
+            payload++;
+            shift += 8;
+        }
+        break;
+    case AC_VERB_GET_CONNECT_SEL:
+        response = ns->conn_sel;
+        break;
+    case AC_VERB_SET_CONNECT_SEL:
+        param = hda_codec_find_param(node, AC_PAR_CONNLIST_LEN);
+        if (param && payload < param->val) {
+            ns->conn_sel = payload;
+        }
+        break;
+
+    /* pins */
+    case AC_VERB_GET_CONFIG_DEFAULT:
+        response = ns->config;
+        break;
+    case AC_VERB_SET_CONFIG_DEFAULT_BYTES_0:
+    case AC_VERB_SET_CONFIG_DEFAULT_BYTES_1:
+    case AC_VERB_SET_CONFIG_DEFAULT_BYTES_2:
+    case AC_VERB_SET_CONFIG_DEFAULT_BYTES_3:
+        shift = (verb - AC_VERB_SET_CONFIG_DEFAULT_BYTES_0) * 8;
+        ns->config = (ns->config & ~(0xffu << shift)) | (payload << shift);
+        break;
+    case AC_VERB_GET_PIN_WIDGET_CONTROL:
+        response = ns->pinctl;
+        break;
+    case AC_VERB_SET_PIN_WIDGET_CONTROL:
+        ns->pinctl = payload;
+        break;
+    case AC_VERB_GET_PIN_SENSE:
+    case AC_VERB_SET_PIN_SENSE:
+        break;
+    case AC_VERB_GET_EAPD_BTLENABLE:
+        response = ns->eapd;
+        break;
+    case AC_VERB_SET_EAPD_BTLENABLE:
+        ns->eapd = payload;
+        break;
+    case AC_VERB_GET_UNSOLICITED_RESPONSE:
+        response = ns->unsol;
+        break;
+    case AC_VERB_SET_UNSOLICITED_ENABLE:
+        ns->unsol = payload;
+        break;
+
+    /* misc per-node registers */
+    case AC_VERB_GET_POWER_STATE:
+        response = (ns->power << 4) | ns->power;
+        break;
+    case AC_VERB_SET_POWER_STATE:
+        ns->power = payload & 0x0f;
+        break;
+    case AC_VERB_GET_SDI_SELECT:
+        response = ns->sdi;
+        break;
+    case AC_VERB_SET_SDI_SELECT:
+        ns->sdi = payload;
+        break;
+    case AC_VERB_GET_BEEP_CONTROL:
+        response = ns->beep;
+        break;
+    case AC_VERB_SET_BEEP_CONTROL:
+        ns->beep = payload;
+        break;
+    case AC_VERB_GET_DIGI_CONVERT_1:
+        response = ns->digi;
+        break;
+    case AC_VERB_SET_DIGI_CONVERT_1:
+        ns->digi = (ns->digi & 0xff00) | payload;
+        break;
+    case AC_VERB_SET_DIGI_CONVERT_2:
+        ns->digi = (ns->digi & 0x00ff) | (payload << 8);
+        break;
+    case AC_VERB_GET_COEF_INDEX:
+        response = ns->coef_index;
+        break;
+    case AC_VERB_SET_COEF_INDEX:
+        ns->coef_index = payload;
+        break;
+    case AC_VERB_GET_PROC_COEF:
+    case AC_VERB_SET_PROC_COEF:
+    case AC_VERB_GET_PROC_STATE:
+    case AC_VERB_SET_PROC_STATE:
+    case AC_VERB_GET_VOLUME_KNOB_CONTROL:
+    case AC_VERB_SET_VOLUME_KNOB_CONTROL:
+        break;
+
+    /* function group GPIOs */
+    case AC_VERB_GET_GPIO_DATA ... AC_VERB_GET_GPIO_STICKY_MASK:
+        response = a->gpio[verb - AC_VERB_GET_GPIO_DATA];
+        break;
+    case AC_VERB_SET_GPIO_DATA ... AC_VERB_SET_GPIO_STICKY_MASK:
+        a->gpio[verb - AC_VERB_SET_GPIO_DATA] = payload;
+        break;
+
+    /* converters */
+    case AC_VERB_SET_CHANNEL_STREAMID:
+        ns->conv = payload;
+        if (st) {
+            hda_audio_set_running(st, false);
+            st->stream = (payload >> 4) & 0x0f;
+            st->channel = payload & 0x0f;
+            dprint(a, 2, "%s: stream %d, channel %d\n",
+                   st->node->name, st->stream, st->channel);
+            hda_audio_stateful_setup(st);
+            hda_audio_set_amp(st);
+            hda_audio_set_running(st,
+                a->running_real[st->output * 16 + st->stream]);
+        }
+        break;
+    case AC_VERB_GET_CONV:
+        response = st ? (st->stream << 4 | st->channel) : ns->conv;
+        break;
+    case AC_VERB_SET_STREAM_FORMAT:
+        ns->format = payload;
+        if (st) {
+            st->format = payload;
+            hda_audio_stateful_setup(st);
+            hda_audio_set_amp(st);
+        }
+        break;
+    case AC_VERB_GET_STREAM_FORMAT:
+        response = st ? st->format : ns->format;
+        break;
+
+    /* amplifiers, on any node */
+    case AC_VERB_GET_AMP_GAIN_MUTE:
+        lr = (payload & AC_AMP_GET_LEFT) ? 0 : 1;
+        idx = payload & AC_AMP_GET_INDEX;
+        if (payload & AC_AMP_GET_OUTPUT) {
+            response = ns->amp_out[lr];
+        } else if (idx < HDA_MAX_CONN) {
+            response = ns->amp_in[idx][lr];
+        }
+        break;
+    case AC_VERB_SET_AMP_GAIN_MUTE:
+        idx = (payload & AC_AMP_SET_INDEX) >> AC_AMP_SET_INDEX_SHIFT;
+        for (lr = 0; lr < 2; lr++) {
+            if (!(payload & (lr ? AC_AMP_SET_RIGHT : AC_AMP_SET_LEFT))) {
+                continue;
+            }
+            if (payload & AC_AMP_SET_OUTPUT) {
+                ns->amp_out[lr] = payload & 0xff;
+            }
+            if ((payload & AC_AMP_SET_INPUT) && idx < HDA_MAX_CONN) {
+                ns->amp_in[idx][lr] = payload & 0xff;
+            }
+        }
+        hda_audio_stateful_sync_amps(a);
+        break;
+
+    case AC_VERB_SET_CODEC_RESET:
+        hda_audio_stateful_reset(a);
+        break;
+
+    default:
+        dprint(a, 1, "%s: not handled: nid %d (%s), verb 0x%x, payload 0x%x\n",
+               __func__, node->nid, node->name, verb, payload);
+        break;
+    }
+    hda_codec_response(&a->hda, true, response);
+}
+
 static void hda_audio_command(HDACodecDevice *hda, uint32_t nid, uint32_t data)
 {
     HDAAudioState *a = HDA_AUDIO(hda);
@@ -469,6 +910,11 @@ static void hda_audio_command(HDACodecDevice *hda, uint32_t nid, uint32_t data)
     }
     dprint(a, 2, "%s: nid %d (%s), verb 0x%x, payload 0x%x\n",
            __func__, nid, node->name, verb, payload);
+
+    if (a->desc->stateful) {
+        hda_audio_command_stateful(a, node, verb, payload);
+        return;
+    }
 
     switch (verb) {
     /* all nodes */
@@ -650,7 +1096,15 @@ static void hda_audio_init(HDACodecDevice *hda,
         if (param == NULL) {
             continue;
         }
+        if (desc->stateful && node->nid >= HDA_MAX_NID) {
+            error_setg(errp, "%s: node 0x%x out of range", desc->name,
+                       node->nid);
+            return;
+        }
         type = (param->val & AC_WCAP_TYPE) >> AC_WCAP_TYPE_SHIFT;
+        if (node->stindex == HDA_NO_STREAM) {
+            continue;
+        }
         switch (type) {
         case AC_WID_AUD_OUT:
         case AC_WID_AUD_IN:
@@ -671,12 +1125,20 @@ static void hda_audio_init(HDACodecDevice *hda,
                 st->buft = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                         hda_audio_input_timer, st);
             }
+            st->amp_steps = QEMU_HDA_AMP_STEPS;
+            st->dma_channels = 2;
             st->format = AC_FMT_TYPE_PCM | AC_FMT_BITS_16 |
                 (1 << AC_FMT_CHAN_SHIFT);
             hda_codec_parse_fmt(st->format, &st->as);
-            hda_audio_setup(st);
+            if (!desc->stateful) {
+                hda_audio_setup(st);
+            }
             break;
         }
+    }
+
+    if (desc->stateful) {
+        hda_audio_stateful_reset(a);
     }
 }
 
@@ -718,10 +1180,17 @@ static int hda_audio_post_load(void *opaque, int version)
         st = a->st + i;
         if (st->node == NULL)
             continue;
-        hda_codec_parse_fmt(st->format, &st->as);
-        hda_audio_setup(st);
+        if (a->desc->stateful) {
+            hda_audio_stateful_setup(st);
+        } else {
+            hda_codec_parse_fmt(st->format, &st->as);
+            hda_audio_setup(st);
+        }
         hda_audio_set_amp(st);
         hda_audio_set_running(st, a->running_real[st->output * 16 + st->stream]);
+    }
+    if (a->desc->stateful) {
+        hda_audio_stateful_sync_amps(a);
     }
     return 0;
 }
@@ -738,6 +1207,9 @@ static void hda_audio_reset(DeviceState *dev)
         if (st->node != NULL) {
             hda_audio_set_running(st, false);
         }
+    }
+    if (a->desc && a->desc->stateful) {
+        hda_audio_stateful_reset(a);
     }
 }
 
@@ -782,17 +1254,65 @@ static const VMStateDescription vmstate_hda_audio_stream = {
     }
 };
 
+static const VMStateDescription vmstate_hda_node = {
+    .name = "hda-audio-node",
+    .version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(amp_out, HDANodeState, 2),
+        VMSTATE_UINT8_2DARRAY(amp_in, HDANodeState, HDA_MAX_CONN, 2),
+        VMSTATE_UINT8(conn_sel, HDANodeState),
+        VMSTATE_UINT8(pinctl, HDANodeState),
+        VMSTATE_UINT8(power, HDANodeState),
+        VMSTATE_UINT8(eapd, HDANodeState),
+        VMSTATE_UINT8(unsol, HDANodeState),
+        VMSTATE_UINT8(sdi, HDANodeState),
+        VMSTATE_UINT8(beep, HDANodeState),
+        VMSTATE_UINT8(conv, HDANodeState),
+        VMSTATE_UINT16(format, HDANodeState),
+        VMSTATE_UINT16(digi, HDANodeState),
+        VMSTATE_UINT16(coef_index, HDANodeState),
+        VMSTATE_UINT32(config, HDANodeState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool vmstate_hda_audio_stateful_needed(void *opaque)
+{
+    HDAAudioState *a = opaque;
+    return a->desc && a->desc->stateful;
+}
+
+static const VMStateDescription vmstate_hda_audio_stateful = {
+    .name = "hda-audio/stateful",
+    .version_id = 1,
+    .needed = vmstate_hda_audio_stateful_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_SUB_ARRAY(st, HDAAudioState, 4,
+                                 HDA_AUDIO_MAX_STREAMS - 4, 0,
+                                 vmstate_hda_audio_stream, HDAAudioStream),
+        VMSTATE_STRUCT_ARRAY(nodes, HDAAudioState, HDA_MAX_NID, 0,
+                             vmstate_hda_node, HDANodeState),
+        VMSTATE_UINT8_ARRAY(gpio, HDAAudioState, HDA_GPIO_NREGS),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_hda_audio = {
     .name = "hda-audio",
     .version_id = 2,
     .post_load = hda_audio_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_STRUCT_ARRAY(st, HDAAudioState, 4, 0,
-                             vmstate_hda_audio_stream,
-                             HDAAudioStream),
+        /* the first four streams keep the pre-stateful layout */
+        VMSTATE_STRUCT_SUB_ARRAY(st, HDAAudioState, 0, 4, 0,
+                                 vmstate_hda_audio_stream,
+                                 HDAAudioStream),
         VMSTATE_BOOL_ARRAY(running_compat, HDAAudioState, 16),
         VMSTATE_BOOL_ARRAY_V(running_real, HDAAudioState, 2 * 16, 2),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_hda_audio_stateful,
+        NULL
     }
 };
 
@@ -836,6 +1356,11 @@ static void hda_audio_init_micro(HDACodecDevice *hda, Error **errp)
     }
 
     hda_audio_init(hda, desc, errp);
+}
+
+static void hda_audio_init_ad1989a(HDACodecDevice *hda, Error **errp)
+{
+    hda_audio_init(hda, &ad1989a, errp);
 }
 
 static void hda_audio_base_class_init(ObjectClass *klass, const void *data)
@@ -905,12 +1430,29 @@ static const TypeInfo hda_audio_micro_info = {
     .class_init    = hda_audio_micro_class_init,
 };
 
+static void hda_audio_ad1989a_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    HDACodecDeviceClass *k = HDA_CODEC_DEVICE_CLASS(klass);
+
+    k->init = hda_audio_init_ad1989a;
+    dc->desc = "HDA Audio Codec, Analog Devices AD1989A "
+               "(6ch out, 3 ADCs, as wired in the Trilithic EASyCAP)";
+}
+
+static const TypeInfo hda_audio_ad1989a_info = {
+    .name          = "hda-ad1989a",
+    .parent        = TYPE_HDA_AUDIO,
+    .class_init    = hda_audio_ad1989a_class_init,
+};
+
 static void hda_audio_register_types(void)
 {
     type_register_static(&hda_audio_info);
     type_register_static(&hda_audio_output_info);
     type_register_static(&hda_audio_duplex_info);
     type_register_static(&hda_audio_micro_info);
+    type_register_static(&hda_audio_ad1989a_info);
 }
 
 type_init(hda_audio_register_types)
